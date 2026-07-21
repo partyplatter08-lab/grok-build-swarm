@@ -169,14 +169,24 @@ fn quoted_desc(desc: &str, max_width: usize) -> String {
     format!("\u{201C}{inner}\u{201D}")
 }
 
+/// Leading `[tag]` parse (same rules as `format_subagent_label`).
+fn parse_desc_tag(description: &str) -> (Option<&str>, &str) {
+    if let Some(rest) = description.strip_prefix('[')
+        && let Some(close) = rest.find(']')
+    {
+        let tag = rest[..close].trim();
+        if !tag.is_empty() {
+            // Prefer the role after a slash: [Council/Analyst] → Analyst
+            let display = tag.rsplit('/').next().unwrap_or(tag);
+            return (Some(display), rest[close + 1..].trim_start());
+        }
+    }
+    (None, description)
+}
+
 impl BlockContent for SubagentBlock {
     fn output(&self, ctx: &BlockContext) -> BlockOutput {
         let theme = Theme::current();
-        // When selected, lift only the bold "Subagent" label to
-        // `text_primary` so it reads as undimmed (mirrors `read.rs` /
-        // `search.rs`, which bump only the label and leave the rest at
-        // `muted`). The detail text (verb + description + meta) stays
-        // muted in every state.
         let bold = if ctx.is_selected {
             theme.primary().add_modifier(Modifier::BOLD)
         } else {
@@ -185,9 +195,6 @@ impl BlockContent for SubagentBlock {
         let muted = theme.muted();
         let w = ctx.width as usize;
 
-        // Multi-agent chrome: detect [Council/], [Swarm/], [SH/] tags so rows
-        // never look like a generic "Subagent" when Heavy/Swarm is running.
-        // Colored like the effort menu (red / purple / rainbow).
         let orch_mode = xai_grok_shell::sampling::types::mode_from_subagent_description(
             &self.description,
         );
@@ -203,6 +210,103 @@ impl BlockContent for SubagentBlock {
             bold
         };
 
+        // Full multi-agent card (Claude/Grok Heavy-style worker row).
+        if orch_mode.is_multi_agent() && w >= 28 {
+            // Role label: persona → role → type → [tag] from description.
+            let (tag, clean_desc) = parse_desc_tag(&self.description);
+            let role = self
+                .persona
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(self.role.as_deref().filter(|s| !s.is_empty()))
+                .map(|s| {
+                    let mut c = s.chars();
+                    match c.next() {
+                        Some(ch) => ch.to_uppercase().chain(c).collect::<String>(),
+                        None => s.to_string(),
+                    }
+                })
+                .or_else(|| {
+                    if self.subagent_type != "general-purpose" && !self.subagent_type.is_empty() {
+                        Some(crate::app::subagent::format_type_label(&self.subagent_type).to_string())
+                    } else {
+                        tag.map(|t| {
+                            let mut c = t.chars();
+                            match c.next() {
+                                Some(ch) => ch.to_uppercase().chain(c).collect(),
+                                None => t.to_string(),
+                            }
+                        })
+                    }
+                })
+                .unwrap_or_else(|| "Worker".to_string());
+            let meta = format_subagent_meta(
+                self.persona.as_deref(),
+                self.role.as_deref(),
+                self.model.as_deref(),
+            );
+            let meta_line = {
+                let mut parts: Vec<&str> = Vec::new();
+                if !self.subagent_type.is_empty() {
+                    parts.push(self.subagent_type.as_str());
+                }
+                let m = meta.trim().trim_start_matches('(').trim_end_matches(')');
+                if !m.is_empty() {
+                    parts.push(m);
+                }
+                parts.join(" · ")
+            };
+            let card_state = match &self.kind {
+                SubagentBlockKind::Started => {
+                    crate::views::orchestration_visuals::SubagentCardState::Running
+                }
+                SubagentBlockKind::Completed { .. } => {
+                    crate::views::orchestration_visuals::SubagentCardState::Completed
+                }
+                SubagentBlockKind::Failed { .. } => {
+                    crate::views::orchestration_visuals::SubagentCardState::Failed
+                }
+                SubagentBlockKind::Cancelled { .. } => {
+                    crate::views::orchestration_visuals::SubagentCardState::Cancelled
+                }
+            };
+            let activity_owned: Option<String> = match &self.kind {
+                SubagentBlockKind::Started => self.activity_label.clone(),
+                SubagentBlockKind::Completed { elapsed } => {
+                    Some(format!("completed in {}", format_duration(*elapsed)))
+                }
+                SubagentBlockKind::Failed { elapsed, error } => Some(format!(
+                    "failed in {}{}",
+                    format_duration(*elapsed),
+                    error
+                        .as_deref()
+                        .map(|e| format!(" ({e})"))
+                        .unwrap_or_default()
+                )),
+                SubagentBlockKind::Cancelled { elapsed } => {
+                    Some(format!("cancelled in {}", format_duration(*elapsed)))
+                }
+            };
+            let lines = crate::views::orchestration_visuals::subagent_card_lines(
+                orch_mode,
+                &role,
+                if clean_desc.is_empty() {
+                    self.description.as_str()
+                } else {
+                    clean_desc
+                },
+                activity_owned.as_deref(),
+                &meta_line,
+                card_state,
+                &theme,
+                w,
+            );
+            return BlockOutput {
+                lines: lines.into_iter().map(Into::into).collect(),
+            };
+        }
+
+        // Stock single-line layout for normal subagents.
         let line = match (&self.kind, self.is_background) {
             (SubagentBlockKind::Started, bg) => {
                 let verb = if bg { "started: " } else { "running: " };
@@ -217,27 +321,13 @@ impl BlockContent for SubagentBlock {
                     self.role.as_deref(),
                     self.model.as_deref(),
                 );
-                // chrome + "running: "/"started: " (= 9 chars for either verb)
                 let overhead = chrome_width + 9 + meta.width() + activity_suffix.width();
                 let desc = quoted_desc(&self.description, w.saturating_sub(overhead));
-                let mut spans = if orch_mode.is_multi_agent() {
-                    let mut s = crate::views::orchestration_visuals::mode_label_spans(
-                        chrome,
-                        orch_mode,
-                        &theme,
-                        true,
-                        theme.bg_base,
-                    );
-                    s.push(Span::styled(verb, muted));
-                    s.push(Span::styled(desc, muted));
-                    s
-                } else {
-                    vec![
-                        Span::styled(chrome, chrome_style),
-                        Span::styled(verb, muted),
-                        Span::styled(desc, muted),
-                    ]
-                };
+                let mut spans = vec![
+                    Span::styled(chrome, chrome_style),
+                    Span::styled(verb, muted),
+                    Span::styled(desc, muted),
+                ];
                 if !activity_suffix.is_empty() {
                     spans.push(Span::styled(activity_suffix, muted));
                 }
@@ -287,9 +377,17 @@ impl BlockContent for SubagentBlock {
 
     fn accent(&self, ctx: &BlockContext) -> Option<AccentStyle> {
         let theme = Theme::current();
+        let orch = xai_grok_shell::sampling::types::mode_from_subagent_description(
+            &self.description,
+        );
         match &self.kind {
             SubagentBlockKind::Started if ctx.is_running => {
-                Some(AccentStyle::static_color(theme.accent_running))
+                let c = if orch.is_multi_agent() {
+                    crate::views::orchestration_visuals::mode_running_color(orch)
+                } else {
+                    theme.accent_running
+                };
+                Some(AccentStyle::animated(c))
             }
             _ => None,
         }
@@ -297,15 +395,21 @@ impl BlockContent for SubagentBlock {
 
     fn bullet(&self, ctx: &BlockContext) -> Option<AccentStyle> {
         let theme = Theme::current();
+        let orch = xai_grok_shell::sampling::types::mode_from_subagent_description(
+            &self.description,
+        );
         match &self.kind {
             SubagentBlockKind::Started => {
                 if ctx.is_running {
+                    let base = if orch.is_multi_agent() {
+                        crate::views::orchestration_visuals::mode_running_color(orch)
+                    } else {
+                        theme.accent_running
+                    };
                     let dim = ctx.appearance.scrollback.display.dim_accent;
-                    let dimmed = blend_color(theme.bg_base, theme.accent_running, dim)
-                        .unwrap_or(theme.accent_running);
+                    let dimmed = blend_color(theme.bg_base, base, dim).unwrap_or(base);
                     Some(AccentStyle::animated(dimmed))
                 } else {
-                    // Finished — gray bullet (same as bg task "started" after completion)
                     None
                 }
             }

@@ -5031,6 +5031,13 @@ impl AppView {
                             )
                             .is_multi_agent()
                         })
+                } || {
+                    // Keyword glow while typing heavy/swarm/ultrathink.
+                    !crate::views::orchestration_visuals::find_mode_keyword_ranges(
+                        agent.prompt.text(),
+                    )
+                    .is_empty()
+                        && !crate::views::orchestration_visuals::reduce_motion()
                 };
                 let fast = agent.scrollback.needs_animation()
                     || multi_agent_anim

@@ -1130,13 +1130,20 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     };
                     agent.show_toast(&toast);
                     if mode.is_multi_agent() {
-                        if let Some(banner) = mode.open_banner() {
+                        // Rich activation panel (live board chrome).
+                        if let Some(banner) =
+                            crate::views::orchestration_visuals::rich_activation_banner(mode)
+                        {
+                            agent
+                                .scrollback
+                                .push_block(RenderBlock::system(banner));
+                        } else if let Some(banner) = mode.open_banner() {
                             agent
                                 .scrollback
                                 .push_block(RenderBlock::system(banner.to_string()));
                         }
                         agent.scrollback.push_block(RenderBlock::system(format!(
-                            "{} mode active — multi-agent orchestration protocol loaded. Workers will appear as {}rows. Depth limit is 1 (only you spawn).",
+                            "{} active · protocol injected · workers render as {}cards · depth 1 only",
                             mode.mark(),
                             mode.subagent_chrome(),
                         )));

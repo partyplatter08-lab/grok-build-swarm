@@ -2829,6 +2829,41 @@ fn paint_slash_token_highlight(
     }
 }
 
+/// Paint multi-agent keywords in the composer with solid shine / rainbow
+/// (mirrors Claude Code ultrathink highlighting).
+fn paint_mode_keyword_highlights(
+    textarea: &TextArea,
+    state: TextAreaState,
+    ta_area: Rect,
+    buf: &mut Buffer,
+    text: &str,
+) {
+    use crate::views::orchestration_visuals::{
+        find_mode_keyword_ranges, mode_keyword_char_color,
+    };
+    for (range, mode) in find_mode_keyword_ranges(text) {
+        let slice = text.get(range.clone()).unwrap_or("");
+        let char_count = slice.chars().count().max(1);
+        // Paint each character so Swarm Heavy can rainbow per-glyph.
+        let mut byte_i = range.start;
+        for (ci, ch) in slice.chars().enumerate() {
+            let ch_len = ch.len_utf8();
+            let ch_range = byte_i..byte_i + ch_len;
+            let fg = mode_keyword_char_color(mode, ci, char_count);
+            for span in textarea.screen_spans_of_range(ch_range, ta_area, state) {
+                for x in span.left()..span.right() {
+                    if let Some(cell) = buf.cell_mut((x, span.y))
+                        && !cell.symbol().trim().is_empty()
+                    {
+                        cell.set_fg(fg);
+                    }
+                }
+            }
+            byte_i += ch_len;
+        }
+    }
+}
+
 impl PromptWidget {
     /// Render the prompt widget.
     ///
@@ -3081,6 +3116,16 @@ impl PromptWidget {
                     slash_hl,
                 );
             }
+
+            // Multi-agent keyword glow (Claude ultrathink energy): typing
+            // "heavy" / "swarm" / "swarm-heavy" / "ultrathink" lights up.
+            paint_mode_keyword_highlights(
+                &self.textarea,
+                self.textarea_state,
+                ta_area,
+                buf,
+                self.textarea.text(),
+            );
 
             (snap.active, snap.inline_ghost.is_some())
         };
