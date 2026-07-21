@@ -1690,7 +1690,12 @@ async fn async_main() -> Result<()> {
     // Product identity MUST be resolved before CLI parse (version/about) and
     // before leader connect. Swarm uses an isolated leader socket so we never
     // attach to a stock `grok` leader and silently run without fork features.
-    let product = product::init_from_env();
+    // The dedicated `grok-swarm` Cargo bin is always Swarm even if the file is
+    // renamed (argv0 alone would otherwise look like stock).
+    let product = match option_env!("CARGO_BIN_NAME") {
+        Some("grok-swarm") => product::init_with(product::ProductFlavor::Swarm),
+        _ => product::init_from_env(),
+    };
     product::apply_swarm_isolation(product);
     let mut args = PagerArgs::parse_and_apply_cwd()?;
     if let Some(ref mode) = args.compaction_mode {

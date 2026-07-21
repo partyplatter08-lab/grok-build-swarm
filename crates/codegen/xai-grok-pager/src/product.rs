@@ -96,8 +96,12 @@ fn flavor_cell() -> &'static OnceLock<ProductFlavor> {
 
 /// Initialize product flavor from process args (call once early in main).
 pub fn init_from_env() -> ProductFlavor {
-    let argv0 = std::env::args().next();
-    let flavor = detect_from_argv0(argv0.as_deref());
+    init_with(detect_from_argv0(std::env::args().next().as_deref()))
+}
+
+/// Initialize with an explicit flavor (used when the Cargo bin target is
+/// `grok-swarm` so renaming the file cannot demote us to stock).
+pub fn init_with(flavor: ProductFlavor) -> ProductFlavor {
     let _ = flavor_cell().set(flavor);
     flavor
 }
