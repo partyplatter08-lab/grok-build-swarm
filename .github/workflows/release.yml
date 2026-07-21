@@ -1,0 +1,155 @@
+# Build and publish grok-swarm binaries to GitHub Releases.
+#
+# Triggers:
+#   - push of tags matching v*  (e.g. git tag v0.2.106 && git push --tags)
+#   - workflow_dispatch (manual) with optional tag input
+#
+# Assets:
+#   grok-swarm-{version}-{os}-{arch}   (macos-aarch64, macos-x86_64, linux-x86_64, linux-aarch64)
+#
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.106). Leave empty to use run id."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset_triple: macos-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset_triple: macos-x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset_triple: linux-x86_64
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            asset_triple: linux-aarch64
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install DotSlash (protoc)
+        run: cargo install dotslash --locked
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (linux aarch64)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build -p xai-grok-pager-bin --release --bin grok-swarm --target ${{ matrix.target }}
+          else
+            cargo build -p xai-grok-pager-bin --release --bin grok-swarm --target ${{ matrix.target }}
+          fi
+          BIN="target/${{ matrix.target }}/release/grok-swarm"
+          # Some targets put the binary without target/ prefix on host
+          if [[ ! -f "$BIN" ]]; then
+            BIN="target/release/grok-swarm"
+          fi
+          test -x "$BIN"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            VER="${{ inputs.tag }}"
+            VER="${VER#v}"
+          else
+            VER="0.0.0-dev.${{ github.run_number }}"
+          fi
+          ASSET="grok-swarm-${VER}-${{ matrix.asset_triple }}"
+          cp "$BIN" "$ASSET"
+          chmod +x "$ASSET"
+          # smoke
+          if [[ "${{ matrix.cross }}" != "true" ]]; then
+            ./"$ASSET" --version || true
+          fi
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          ls -lh "$ASSET"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-22.04
+    if: github.ref_type == 'tag' || inputs.tag != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ inputs.tag }}"
+            [[ "$TAG" == v* ]] || TAG="v${TAG}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          ls -la dist/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: grok-swarm ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

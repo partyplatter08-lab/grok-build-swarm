@@ -11,7 +11,13 @@ use xai_grok_shell::util::grok_home::grok_home;
 
 const TTL_SECONDS_BEFORE_AUTO_UPDATE: Duration = Duration::from_secs(60 * 30);
 const NPM_PACKAGE: &str = "@xai-official/grok";
-pub const GH_RELEASE_REPO: &str = "xai-org-shared/grok-build";
+/// GitHub repo used for the `gh-release` installer / auto-update path.
+/// This fork ships `grok-swarm` from partyplatter08-lab/grok-build-swarm.
+pub const GH_RELEASE_REPO: &str = "partyplatter08-lab/grok-build-swarm";
+
+/// Binary name prefix for GitHub Release artifacts and managed bin links.
+/// Stock was `"grok"`; this fork installs as `"grok-swarm"`.
+pub const GH_RELEASE_BIN_PREFIX: &str = "grok-swarm";
 
 /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching
 /// for binaries and origin-respecting no-cache for channel pointers.
@@ -188,6 +194,24 @@ pub async fn fetch_gh_release_version(channel: &str) -> Result<String> {
 }
 
 async fn fetch_gh_release_latest(exclude_pre: bool) -> Result<String> {
+    // Prefer `gh` when available; fall back to the public GitHub API (no auth).
+    match fetch_gh_release_latest_via_cli(exclude_pre).await {
+        Ok(v) => Ok(v),
+        Err(cli_err) => {
+            tracing::debug!(error = %cli_err, "gh release list failed; trying HTTPS API");
+            fetch_gh_release_latest_via_https(exclude_pre)
+                .await
+                .map_err(|api_err| {
+                    anyhow::anyhow!(
+                        "could not list releases for {GH_RELEASE_REPO} \
+                         (gh: {cli_err:#}; api: {api_err:#})"
+                    )
+                })
+        }
+    }
+}
+
+async fn fetch_gh_release_latest_via_cli(exclude_pre: bool) -> Result<String> {
     let mut args = vec![
         "release",
         "list",
@@ -216,8 +240,41 @@ async fn fetch_gh_release_latest(exclude_pre: bool) -> Result<String> {
     }
 
     let tag = String::from_utf8(output.stdout)?.trim().to_string();
-    // Tags are formatted as "v0.1.141", strip the leading "v"
     let version = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+    if version.is_empty() {
+        anyhow::bail!("No releases found in {}", GH_RELEASE_REPO);
+    }
+    Ok(version)
+}
+
+async fn fetch_gh_release_latest_via_https(exclude_pre: bool) -> Result<String> {
+    // /releases/latest skips drafts and prereleases. For alpha we list releases.
+    let url = if exclude_pre {
+        format!("https://api.github.com/repos/{GH_RELEASE_REPO}/releases/latest")
+    } else {
+        format!("https://api.github.com/repos/{GH_RELEASE_REPO}/releases?per_page=1")
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent(format!("grok-swarm-updater/{}", xai_grok_version::VERSION))
+        .build()?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("GitHub API {url} returned HTTP {}", resp.status());
+    }
+    let body: Value = resp.json().await?;
+    let tag = if exclude_pre {
+        body.get("tag_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("latest release missing tag_name"))?
+    } else {
+        body.as_array()
+            .and_then(|a| a.first())
+            .and_then(|r| r.get("tag_name"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("releases list empty or missing tag_name"))?
+    };
+    let version = tag.strip_prefix('v').unwrap_or(tag).to_string();
     if version.is_empty() {
         anyhow::bail!("No releases found in {}", GH_RELEASE_REPO);
     }
@@ -438,12 +495,22 @@ pub use xai_grok_version::installed as get_installed_grok_version;
 pub fn installed_on_disk_version() -> Option<String> {
     #[cfg(unix)]
     {
-        let app = xai_grok_shell::util::grok_home::grok_application();
-        let target = std::fs::read_link(&app).ok()?;
-        // metadata() follows the symlink: Err means the target is gone
-        // (dangling link) and the version it names is not actually on disk.
-        std::fs::metadata(&app).ok()?;
-        version_from_versioned_binary_name(target.file_name()?.to_str()?, "grok")
+        // Prefer this fork's managed `grok-swarm` link; fall back to stock `grok`.
+        let home = grok_home();
+        for (link_name, prefix) in [
+            (GH_RELEASE_BIN_PREFIX, GH_RELEASE_BIN_PREFIX),
+            ("grok", "grok"),
+        ] {
+            let app = home.join("bin").join(link_name);
+            if let Ok(target) = std::fs::read_link(&app)
+                && std::fs::metadata(&app).is_ok()
+                && let Some(name) = target.file_name().and_then(|n| n.to_str())
+                && let Some(v) = version_from_versioned_binary_name(name, prefix)
+            {
+                return Some(v);
+            }
+        }
+        None
     }
     #[cfg(not(unix))]
     {

@@ -38,6 +38,16 @@ for the version of the code present in this tree.
 
 ---
 
+## Install Grok Build Swarm (`grok-swarm`)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/partyplatter08-lab/grok-build-swarm/main/install.sh | bash
+grok-swarm
+```
+
+Coexists with stock `grok`. Auto-updates from GitHub Releases. See [FORK.md](FORK.md).
+
+
 > **Fork:** This is **Grok Build Swarm** — a public fork of
 > [xai-org/grok-build](https://github.com/xai-org/grok-build) with native
 > multi-agent effort modes (**Heavy**, **Agent Swarm**, **Swarm Heavy**).

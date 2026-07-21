@@ -2,18 +2,19 @@
 
 **Public fork of [xai-org/grok-build](https://github.com/xai-org/grok-build)** with native multi-agent orchestration modes in the effort selector.
 
-## Install the CLI (`grok-swarm`)
+## Install (one-liner, like stock `grok`)
 
-Stock Grok Build stays as `grok`. This fork installs as **`grok-swarm`** so both can coexist.
+Stock Grok Build stays as `grok`. This fork installs as **`grok-swarm`** so both coexist.
 
 ```sh
-git clone https://github.com/partyplatter08-lab/grok-build-swarm.git
-cd grok-build-swarm
-./scripts/install-cli.sh          # release build → ~/.local/bin/grok-swarm
-# or: ./scripts/install-cli.sh --debug   # faster
+curl -fsSL https://raw.githubusercontent.com/partyplatter08-lab/grok-build-swarm/main/install.sh | bash
 ```
 
-Then launch a normal interactive session just like `grok`:
+That downloads the latest **GitHub Release** binary for your platform into
+`~/.grok/downloads/`, links `~/.grok/bin/grok-swarm` (and `~/.local/bin/grok-swarm`),
+and turns on **auto-update** (`[cli] installer = "gh-release"`, `auto_update = true`).
+
+Then launch a normal interactive session:
 
 ```sh
 grok-swarm
@@ -22,7 +23,44 @@ grok-swarm "scaffold a monorepo" --effort swarm
 grok-swarm -p "quick question" --effort heavy   # headless one-shot
 ```
 
-Requires Rust + [DotSlash](https://dotslash-cli.com) (same as upstream). Auth uses the same `~/.grok/` credentials as stock `grok`.
+### Updates
+
+With auto-update enabled (default from the installer):
+
+- On launch the app checks GitHub Releases for a newer `grok-swarm` and
+  downloads it in the background (same idea as stock `grok`).
+- Force an update any time:
+
+```sh
+grok-swarm update
+# or re-run the installer
+curl -fsSL https://raw.githubusercontent.com/partyplatter08-lab/grok-build-swarm/main/install.sh | bash
+```
+
+### Build from source (optional)
+
+```sh
+git clone https://github.com/partyplatter08-lab/grok-build-swarm.git
+cd grok-build-swarm
+./scripts/install-cli.sh          # release build
+# or: ./scripts/install-cli.sh --debug
+```
+
+Requires Rust + [DotSlash](https://dotslash-cli.com). Auth uses the same
+`~/.grok/` credentials as stock `grok`.
+
+### Releases
+
+GitHub Actions (`.github/workflows/release.yml`) builds multi-platform
+binaries when you push a tag:
+
+```sh
+git tag v0.2.106
+git push origin v0.2.106
+```
+
+Assets are named `grok-swarm-{version}-{os}-{arch}`
+(e.g. `grok-swarm-0.2.106-macos-aarch64`).
 
 ## What’s new
 

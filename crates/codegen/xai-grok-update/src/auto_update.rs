@@ -29,9 +29,9 @@ const MSG_RUN_UPDATE_MANUAL: &str = "Run `grok update` to get the latest version
 /// Manual-install one-liner for this platform's bootstrap installer.
 fn manual_install_cmd() -> &'static str {
     if cfg!(windows) {
-        "irm https://x.ai/cli/install.ps1 | iex"
+        "irm https://raw.githubusercontent.com/partyplatter08-lab/grok-build-swarm/main/install.ps1 | iex"
     } else {
-        "curl -fsSL https://x.ai/cli/install.sh | bash"
+        "curl -fsSL https://raw.githubusercontent.com/partyplatter08-lab/grok-build-swarm/main/install.sh | bash"
     }
 }
 
@@ -39,7 +39,12 @@ fn manual_install_cmd() -> &'static str {
 fn reinstall_hint(installer: &str) -> String {
     match installer {
         "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
-        "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
+        "gh-release" => format!(
+            "Please reinstall via:\n  {}\n\
+             Or: gh release download --repo {} --pattern 'grok-swarm-*' --dir ~/.grok/downloads",
+            manual_install_cmd(),
+            crate::version::GH_RELEASE_REPO,
+        ),
         _ => format!("Please reinstall via:\n  {}", manual_install_cmd()),
     }
 }
@@ -2001,17 +2006,18 @@ async fn gh_release_download(tag: &str, pattern: &str, dest: &std::path::Path) -
     Ok(())
 }
 
-/// Download and install grok from GitHub Releases (xai-org-shared/grok-build).
+/// Download and install **grok-swarm** from this fork's GitHub Releases.
 ///
-/// Uses `gh release download` to fetch the binary matching the current platform.
-/// This works anywhere the `gh` CLI is authenticated, without needing npm or
-/// internal network access.
+/// Prefers the `gh` CLI when available; falls back to public HTTPS download
+/// from `https://github.com/{GH_RELEASE_REPO}/releases/...` (no auth needed).
+/// Only manages the `grok-swarm` bin link — never overwrites stock `grok`.
 async fn install_gh_release(target: Option<&str>) -> Result<()> {
     let (os, arch) = detect_platform()?;
     let platform = format!("{}-{}", os, arch);
+    let prefix = crate::version::GH_RELEASE_BIN_PREFIX;
 
     let version = match target {
-        Some(v) => v.to_string(),
+        Some(v) => v.trim_start_matches('v').to_string(),
         None => crate::version::fetch_gh_release_version("stable").await?,
     };
 
@@ -2021,16 +2027,19 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
     tokio::fs::create_dir_all(&download_dir).await?;
     tokio::fs::create_dir_all(&bin_dir).await?;
 
-    let binary_name = format!("grok-{}-{}", version, platform);
+    let binary_name = format!("{prefix}-{version}-{platform}");
     let binary_path = download_dir.join(&binary_name);
-    let tag = format!("v{}", version);
+    let tag = format!("v{version}");
 
     eprintln!(
-        "  Downloading grok v{} ({}) from GitHub Releases...",
-        version, platform
+        "  Downloading {prefix} v{version} ({platform}) from GitHub Releases..."
     );
 
-    gh_release_download(&tag, &binary_name, &binary_path).await?;
+    // Try `gh` first, then public HTTPS (works without gh auth).
+    if let Err(e) = gh_release_download(&tag, &binary_name, &binary_path).await {
+        tracing::warn!(error = %e, "gh release download failed; trying HTTPS");
+        download_gh_release_https(&tag, &binary_name, &binary_path).await?;
+    }
 
     // chmod +x
     #[cfg(unix)]
@@ -2039,51 +2048,105 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
         tokio::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).await?;
     }
 
-    // Atomic swap of ~/.grok/bin/{grok,agent} -> downloaded binary.
-    swap_managed_bin_links(&binary_path, &bin_dir).await?;
-
-    // Update grok-latest -> versioned binary so any existing symlinks that route
-    // through it (e.g. /usr/local/bin/grok -> ~/.grok/downloads/grok-latest)
-    // resolve to the newly installed version.
-    #[cfg(unix)]
-    {
-        let latest_path = download_dir.join("grok-latest");
-        let rel_target = relative_symlink_target(&binary_path, &latest_path);
-        if let Err(e) = atomic_symlink_swap(&rel_target, &latest_path).await {
-            tracing::warn!("Failed to update grok-latest symlink: {e}");
-        }
+    if !smoke_test_binary(&binary_path).await {
+        anyhow::bail!(
+            "downloaded {binary_name} failed smoke test (--version); not installing"
+        );
     }
 
-    // Also update /usr/local/bin/{grok,agent} if either points directly into
-    // ~/.grok/downloads/ (legacy layout — skips the grok-latest indirection).
-    // Permission errors ignored.
+    // Point ~/.grok/bin/grok-swarm at the versioned download (never touch stock grok).
+    let bin_name = if cfg!(windows) {
+        format!("{prefix}.exe")
+    } else {
+        prefix.to_string()
+    };
+    let bin_link = bin_dir.join(&bin_name);
     #[cfg(unix)]
-    for name in ["grok", "agent"] {
-        let system_link = std::path::PathBuf::from(format!("/usr/local/bin/{name}"));
-        if let Ok(existing_target) = tokio::fs::read_link(&system_link).await {
-            let target_str = existing_target.to_string_lossy();
-            if target_str.contains(".grok/downloads/") && !target_str.ends_with("grok-latest") {
-                // Try to update; ignore permission errors
-                let _ = atomic_symlink_swap(&binary_path, &system_link).await;
+    {
+        let rel = relative_symlink_target(&binary_path, &bin_link);
+        atomic_symlink_swap(&rel, &bin_link).await?;
+    }
+    #[cfg(windows)]
+    {
+        windows_replace_exe(&binary_path, &bin_link).await?;
+    }
+
+    // Convenience copy into ~/.local/bin when that directory exists.
+    #[cfg(unix)]
+    if let Some(home) = dirs_next_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let local_bin = home.join(".local/bin");
+        if local_bin.is_dir() {
+            let dest = local_bin.join(prefix);
+            if let Err(e) = tokio::fs::copy(&binary_path, &dest).await {
+                tracing::debug!(error = %e, "optional ~/.local/bin copy skipped");
+            } else {
+                let _ = tokio::fs::set_permissions(
+                    &dest,
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .await;
             }
         }
     }
 
-    remove_stale_pager(&bin_dir).await;
-
+    eprintln!("  Installed {prefix} v{version} → {}", bin_link.display());
     eprintln!();
 
-    // Clean up old versioned binaries (keeps current + 1 previous).
-    cleanup_old_downloads(&download_dir, "grok", &version).await;
-    cleanup_old_downloads(&download_dir, "grok-pager", &version).await;
+    cleanup_old_downloads(&download_dir, prefix, &version).await;
 
-    // Persist installer to config.toml so future runs auto-detect gh-release.
+    // Persist installer so future auto-update uses this path.
     let _ = config::update_config(|st| {
         st.cli.installer = Some("gh-release".to_string());
+        st.cli.auto_update = Some(true);
     })
     .await;
 
+    // Cache the installed version for disk_version_for_installer probes.
+    let _ = crate::version::write_version_cache(&version, Some(&version)).await;
+
     Ok(())
+}
+
+/// Public HTTPS download of a release asset (no `gh` CLI required).
+async fn download_gh_release_https(
+    tag: &str,
+    asset_name: &str,
+    dest: &std::path::Path,
+) -> Result<()> {
+    let url = format!(
+        "https://github.com/{}/releases/download/{tag}/{asset_name}",
+        crate::version::GH_RELEASE_REPO
+    );
+    let client = reqwest::Client::builder()
+        .timeout(DOWNLOAD_REQUEST_TIMEOUT)
+        .user_agent(format!(
+            "grok-swarm-updater/{}",
+            xai_grok_version::VERSION
+        ))
+        .build()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("download {url} returned HTTP {}", resp.status());
+    }
+    let bytes = resp.bytes().await?;
+    let tmp = tmp_download_path(dest);
+    tokio::fs::write(&tmp, &bytes).await?;
+    publish_downloaded_artifact(&tmp, dest).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn dirs_next_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+#[cfg(not(unix))]
+fn dirs_next_home() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// Creates a temporary .npmrc file with the NPM token if present.
