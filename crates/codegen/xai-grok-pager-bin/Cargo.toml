@@ -15,6 +15,12 @@ default-run = "xai-grok-pager"
 name = "xai-grok-pager"
 path = "src/main.rs"
 
+# Public CLI name for this fork (Grok Build Swarm). Same entrypoint as
+# xai-grok-pager; install as `grok-swarm` so it coexists with stock `grok`.
+[[bin]]
+name = "grok-swarm"
+path = "src/main.rs"
+
 [dependencies]
 # The pager library (all application logic + the public API main.rs drives).
 xai-grok-pager = { path = "../xai-grok-pager" }

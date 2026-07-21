@@ -2,6 +2,28 @@
 
 **Public fork of [xai-org/grok-build](https://github.com/xai-org/grok-build)** with native multi-agent orchestration modes in the effort selector.
 
+## Install the CLI (`grok-swarm`)
+
+Stock Grok Build stays as `grok`. This fork installs as **`grok-swarm`** so both can coexist.
+
+```sh
+git clone https://github.com/partyplatter08-lab/grok-build-swarm.git
+cd grok-build-swarm
+./scripts/install-cli.sh          # release build → ~/.local/bin/grok-swarm
+# or: ./scripts/install-cli.sh --debug   # faster
+```
+
+Then launch a normal interactive session just like `grok`:
+
+```sh
+grok-swarm
+grok-swarm --effort swarm-heavy
+grok-swarm "scaffold a monorepo" --effort swarm
+grok-swarm -p "quick question" --effort heavy   # headless one-shot
+```
+
+Requires Rust + [DotSlash](https://dotslash-cli.com) (same as upstream). Auth uses the same `~/.grok/` credentials as stock `grok`.
+
 ## What’s new
 
 Three multi-agent modes appear **above High** in the effort selector (`/effort` and the model picker):
