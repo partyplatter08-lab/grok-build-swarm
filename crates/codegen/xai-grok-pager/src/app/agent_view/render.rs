@@ -2209,10 +2209,11 @@ impl AgentView {
         let usage_warning_critical = warning.is_some_and(|(_, critical)| critical);
         // Prefer menu option labels (Heavy / Agent Swarm / Swarm Heavy) over the
         // wire effort token — multi-agent modes all wire as xhigh.
+        // mark() is glyph-only; label is the mode name (no "HEAVY Heavy" dup).
         let orch_mode = self.session.models.orchestration_mode();
         let model_label = match self.session.models.effort_display_label() {
             Some(label) if orch_mode.is_multi_agent() => {
-                format!("{} · {model_id} ({label})", orch_mode.mark())
+                format!("{} {model_id} · {label}", orch_mode.mark())
             }
             Some(label) => format!("{model_id} ({label})"),
             None => model_id,

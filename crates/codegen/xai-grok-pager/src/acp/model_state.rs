@@ -191,7 +191,14 @@ impl ModelState {
         if let Some(id) = option_id {
             self.reasoning_effort_option_id = Some(id);
         } else if let Some(effort) = self.reasoning_effort {
+            // Preserve multi-agent option ids (heavy/swarm/swarm-heavy) when a
+            // ModelChanged / set_current only carries the wire effort (xhigh).
+            // Without this, the footer silently reverts to "xhigh" after send.
             let keep = self.reasoning_effort_option_id.as_ref().is_some_and(|id| {
+                let mode = OrchestrationMode::from_option_id(id);
+                if mode.is_multi_agent() {
+                    return mode.wire_effort() == effort;
+                }
                 self.reasoning_effort_options_for(&model_id)
                     .iter()
                     .any(|o| o.id.eq_ignore_ascii_case(id) && o.value == effort)
@@ -487,6 +494,65 @@ mod tests {
             state.reasoning_effort,
             Some(ReasoningEffort::Xhigh),
             "catalog refresh must not clobber a user-set per-session effort"
+        );
+    }
+
+    #[test]
+    fn set_current_preserves_multi_agent_option_id_on_wire_xhigh_echo() {
+        let id = acp::ModelId::new(Arc::from("grok-4"));
+        let mut state = ModelState::default();
+        state.available.insert(
+            id.clone(),
+            model_with_effort("grok-4", "Grok 4", "xhigh"),
+        );
+        // User selected Heavy (option id) which wires as xhigh.
+        state.set_current_with_option(
+            id.clone(),
+            Some(ReasoningEffort::Xhigh),
+            Some("heavy".into()),
+        );
+        assert_eq!(state.reasoning_effort_option_id.as_deref(), Some("heavy"));
+        assert_eq!(state.orchestration_mode(), OrchestrationMode::Heavy);
+
+        // ModelChanged echo: same model, wire xhigh, no option id.
+        state.set_current(id.clone(), Some(ReasoningEffort::Xhigh));
+        assert_eq!(
+            state.reasoning_effort_option_id.as_deref(),
+            Some("heavy"),
+            "wire-only set_current must not revert multi-agent option id to xhigh"
+        );
+        assert_eq!(state.orchestration_mode(), OrchestrationMode::Heavy);
+
+        // Same for swarm / swarm-heavy.
+        for (oid, mode) in [
+            ("swarm", OrchestrationMode::Swarm),
+            ("swarm-heavy", OrchestrationMode::SwarmHeavy),
+        ] {
+            state.set_current_with_option(
+                id.clone(),
+                Some(ReasoningEffort::Xhigh),
+                Some(oid.into()),
+            );
+            state.set_current(id.clone(), Some(ReasoningEffort::Xhigh));
+            assert_eq!(
+                state.reasoning_effort_option_id.as_deref(),
+                Some(oid),
+                "preserved option for {oid}"
+            );
+            assert_eq!(state.orchestration_mode(), mode);
+        }
+
+        // Real effort change to high *should* clear multi-agent option.
+        state.set_current_with_option(
+            id.clone(),
+            Some(ReasoningEffort::Xhigh),
+            Some("heavy".into()),
+        );
+        state.set_current(id, Some(ReasoningEffort::High));
+        assert_eq!(
+            state.reasoning_effort_option_id.as_deref(),
+            Some("high"),
+            "changing wire effort away from multi-agent must drop the mode"
         );
     }
 

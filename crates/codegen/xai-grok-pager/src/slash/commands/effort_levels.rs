@@ -88,8 +88,9 @@ pub(crate) fn build_effort_arg_items_with_option_id(
             let active_suffix = if active { " (active)" } else { "" };
             let insert_text = insert_text_for(option);
             let sort_prefix = char::from(b'a' + idx as u8);
-            // Multi-agent rows get a brand mark so the dropdown feels distinct
+            // Multi-agent rows get a brand glyph so the dropdown feels distinct
             // from plain high/medium (and pairs with colored hover styles).
+            // mark() is glyph-only; option.label already carries "Heavy" / etc.
             let mode = OrchestrationMode::from_option_id(&option.id);
             let label = if mode.is_multi_agent() {
                 format!("{} {}{active_suffix}", mode.mark(), option.label)
@@ -151,5 +152,36 @@ mod tests {
         assert!(swarm.display.contains("(active)"), "{}", swarm.display);
         let xhigh = items.iter().find(|i| i.insert_text == "xhigh").unwrap();
         assert!(!xhigh.display.contains("(active)"), "{}", xhigh.display);
+    }
+
+    #[test]
+    fn multi_agent_rows_do_not_duplicate_mode_name() {
+        let opts = legacy_effort_options();
+        let items = build_effort_arg_items_with_option_id(
+            &opts,
+            Some(ReasoningEffort::Xhigh),
+            Some("heavy"),
+            true,
+            |o| o.id.clone(),
+        );
+        let heavy = items.iter().find(|i| i.insert_text == "heavy").unwrap();
+        // Glyph + single label — never "◈ HEAVY Heavy" / "⬡ SWARM Agent Swarm".
+        assert_eq!(heavy.display, "◈ Heavy (active)", "{}", heavy.display);
+        let swarm = items.iter().find(|i| i.insert_text == "swarm").unwrap();
+        assert_eq!(swarm.display, "⬡ Agent Swarm", "{}", swarm.display);
+        let sh = items
+            .iter()
+            .find(|i| i.insert_text == "swarm-heavy")
+            .unwrap();
+        assert_eq!(sh.display, "⬢ Swarm Heavy", "{}", sh.display);
+        assert!(
+            !heavy.display.contains("HEAVY Heavy")
+                && !swarm.display.contains("SWARM Agent")
+                && !sh.display.contains("HEAVY Swarm"),
+            "duplicate brand text leaked into dropdown: heavy={}, swarm={}, sh={}",
+            heavy.display,
+            swarm.display,
+            sh.display
+        );
     }
 }

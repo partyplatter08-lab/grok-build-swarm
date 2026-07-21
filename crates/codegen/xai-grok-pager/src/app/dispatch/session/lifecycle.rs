@@ -1123,8 +1123,8 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     };
                     agent.scrollback.push_block(RenderBlock::system(msg));
                     let toast = match (mode.is_multi_agent(), effort_label.as_deref()) {
-                        (true, Some(label)) => format!("{} · {label}", mode.mark()),
-                        (true, None) => mode.mark().to_string(),
+                        (true, Some(label)) => format!("{} {label}", mode.mark()),
+                        (true, None) => mode.brand(),
                         (false, Some(label)) => format!("Effort: {label}"),
                         (false, None) => "Model switched".to_string(),
                     };
@@ -1144,7 +1144,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                         }
                         agent.scrollback.push_block(RenderBlock::system(format!(
                             "{} active · protocol injected · workers render as {}cards · depth 1 only",
-                            mode.mark(),
+                            mode.brand(),
                             mode.subagent_chrome(),
                         )));
                     }

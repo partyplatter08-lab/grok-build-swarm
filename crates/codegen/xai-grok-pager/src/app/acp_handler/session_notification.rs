@@ -844,6 +844,23 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 .and_then(|s| s.parse::<ReasoningEffort>().ok());
             let prev_model = agent.session.models.current.clone();
             let prev_effort = agent.session.models.reasoning_effort;
+            // Wire-level no-op (same model + same/missing effort): do not call
+            // set_current. Multi-agent modes all wire as xhigh; re-applying
+            // would risk clobbering reasoning_effort_option_id ("heavy" →
+            // "xhigh") on every echo, including after the user sends a prompt.
+            let model_same = prev_model.as_ref() == Some(&new_model_id);
+            let effort_unchanged = match effort {
+                Some(e) => prev_effort == Some(e),
+                None => true,
+            };
+            if model_same && effort_unchanged {
+                tracing::debug!(
+                    session_id = session_notif.session_id.0.as_ref(),
+                    model_id = %model_id,
+                    "ignoring ModelChanged broadcast — model/effort unchanged (preserve option id)"
+                );
+                return false;
+            }
             agent
                 .session
                 .models

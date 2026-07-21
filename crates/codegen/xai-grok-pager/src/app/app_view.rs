@@ -898,6 +898,9 @@ pub struct AppView {
     /// Last shimmer frame drawn on the welcome screen. Lets `tick` throttle the
     /// wall-clock logo animation to a few fps instead of the full tick rate.
     pub welcome_shimmer_frame: u64,
+    /// Last multi-agent (Heavy / Swarm / Swarm Heavy) animation frame so idle
+    /// rainbow/pulse redraws even when the user is not typing or moving.
+    pub multi_agent_anim_frame: u64,
     /// CLI model override (`-m` / `--model`). Seeded into every new
     /// `AgentSession.deferred_model_switch` so the model is applied once
     /// the session is created.
@@ -1317,6 +1320,7 @@ impl AppView {
             session_picker_entries_query: None,
             welcome_tick: 0,
             welcome_shimmer_frame: 0,
+            multi_agent_anim_frame: 0,
             cli_model_override: None,
             cli_effort_token: None,
             default_yolo: false,
@@ -4695,6 +4699,37 @@ impl AppView {
                 }
             }
         }
+        // Multi-agent footer/chip rainbow + pulse: force redraw on each anim
+        // frame so the effect runs continuously without mouse/keyboard input.
+        if let ActiveView::Agent(id) = self.active_view
+            && let Some(agent) = self.agents.get(&id)
+        {
+            let want_anim = crate::views::orchestration_visuals::needs_multi_agent_animation(
+                agent.session.models.orchestration_mode(),
+            ) || {
+                let snap = agent.prompt.slash_state.snapshot();
+                snap.open
+                    && snap.matches.iter().any(|m| {
+                        crate::views::orchestration_visuals::mode_from_effort_token(
+                            &m.insert_text,
+                        )
+                        .is_multi_agent()
+                    })
+            } || {
+                !crate::views::orchestration_visuals::find_mode_keyword_ranges(
+                    agent.prompt.text(),
+                )
+                .is_empty()
+                    && !crate::views::orchestration_visuals::reduce_motion()
+            };
+            if want_anim {
+                let frame = crate::views::orchestration_visuals::multi_agent_anim_frame();
+                if frame != self.multi_agent_anim_frame {
+                    self.multi_agent_anim_frame = frame;
+                    needs_redraw = true;
+                }
+            }
+        }
         if matches!(self.active_view, ActiveView::AgentDashboard)
             && let Some(d) = self.dashboard.as_mut()
         {
@@ -5397,6 +5432,7 @@ pub(crate) mod tests {
             session_picker_entries_query: None,
             welcome_tick: 0,
             welcome_shimmer_frame: 0,
+            multi_agent_anim_frame: 0,
             startup_warnings: Vec::new(),
             is_api_key_auth: false,
             pending_update_version: None,

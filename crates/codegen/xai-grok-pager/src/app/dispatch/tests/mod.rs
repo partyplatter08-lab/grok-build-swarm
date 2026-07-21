@@ -215,6 +215,7 @@ fn test_app() -> AppView {
         session_picker_entries_query: None,
         welcome_tick: 0,
         welcome_shimmer_frame: 0,
+        multi_agent_anim_frame: 0,
         startup_warnings: Vec::new(),
         is_api_key_auth: false,
         pending_update_version: None,

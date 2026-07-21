@@ -44,23 +44,36 @@ impl OrchestrationMode {
         }
     }
 
-    /// Short brand mark for TUI chrome.
+    /// Short brand glyph for TUI chrome (symbol only — pair with [`Self::label`]).
+    ///
+    /// Do not embed the mode name here; callers that used to concatenate
+    /// `mark()` + `label()` produced duplicates like `"◈ HEAVY Heavy"`.
     pub fn mark(self) -> &'static str {
         match self {
             Self::Normal => "",
-            Self::Heavy => "◈ HEAVY",
-            Self::Swarm => "⬡ SWARM",
-            Self::SwarmHeavy => "⬢ SWARM HEAVY",
+            Self::Heavy => "◈",
+            Self::Swarm => "⬡",
+            Self::SwarmHeavy => "⬢",
         }
     }
 
-    /// Human label shown in the effort footer / toasts.
+    /// Human label shown in the effort footer / toasts / dropdown.
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "Normal",
             Self::Heavy => "Heavy",
             Self::Swarm => "Agent Swarm",
             Self::SwarmHeavy => "Swarm Heavy",
+        }
+    }
+
+    /// `mark` + uppercase brand for banners / one-line status (e.g. `"◈ HEAVY"`).
+    pub fn brand(self) -> String {
+        match self {
+            Self::Normal => String::new(),
+            Self::Heavy => format!("{} HEAVY", self.mark()),
+            Self::Swarm => format!("{} SWARM", self.mark()),
+            Self::SwarmHeavy => format!("{} SWARM HEAVY", self.mark()),
         }
     }
 
@@ -394,6 +407,20 @@ mod tests {
             assert_eq!(opt.value, ReasoningEffort::Xhigh);
             assert!(OrchestrationMode::from_option_id(&opt.id).is_multi_agent());
         }
+    }
+
+    #[test]
+    fn mark_is_glyph_only_brand_has_name() {
+        // mark() must never embed the mode name — UI used to show "HEAVY Heavy".
+        assert_eq!(OrchestrationMode::Heavy.mark(), "◈");
+        assert_eq!(OrchestrationMode::Swarm.mark(), "⬡");
+        assert_eq!(OrchestrationMode::SwarmHeavy.mark(), "⬢");
+        assert_eq!(OrchestrationMode::Heavy.brand(), "◈ HEAVY");
+        assert_eq!(OrchestrationMode::Swarm.brand(), "⬡ SWARM");
+        assert_eq!(OrchestrationMode::SwarmHeavy.brand(), "⬢ SWARM HEAVY");
+        assert_eq!(OrchestrationMode::Heavy.label(), "Heavy");
+        assert!(!OrchestrationMode::Heavy.mark().contains("HEAVY"));
+        assert!(!OrchestrationMode::Swarm.mark().contains("SWARM"));
     }
 
     #[test]
