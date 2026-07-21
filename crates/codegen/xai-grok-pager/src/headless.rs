@@ -882,6 +882,11 @@ pub async fn run_single_turn(
     let mut agent_config = AgentConfig::new_from_toml_cfg(&raw_config)
         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
 
+    if crate::product::flavor().is_swarm() {
+        agent_config.agent.system_prompt_label =
+            Some(crate::product::system_prompt_label(crate::product::flavor()));
+    }
+
     // Canonical-only early stamp; remaps need the post-session catalog resolve below.
     if let Some(ref token) = options.reasoning_effort
         && let Some(effort) = parse_canonical_effort_token(token)

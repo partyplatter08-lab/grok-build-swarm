@@ -78,6 +78,11 @@ Is there a release asset for ${platform}? See https://github.com/${REPO}/release
 fi
 
 chmod +x "$tmp"
+# macOS: ensure ad-hoc signature is valid after download (curl can leave a
+# broken signature → SIGKILL "Code Signature Invalid", looks like a crash).
+if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+  codesign -s - --force --timestamp=none "$tmp" 2>/dev/null || true
+fi
 # Smoke-test before publishing
 if ! "$tmp" --version >/dev/null 2>&1; then
   err "downloaded binary failed --version smoke test"
@@ -87,6 +92,9 @@ dest="${DOWNLOAD_DIR}/${asset}"
 mv -f "$tmp" "$dest"
 trap - EXIT
 chmod +x "$dest"
+if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+  codesign -s - --force --timestamp=none "$dest" 2>/dev/null || true
+fi
 
 # Managed symlink in ~/.grok/bin/grok-swarm
 link="${BIN_DIR}/${BIN_NAME}"
@@ -102,6 +110,9 @@ info "linked ${link} → ${rel}"
 if [[ -d "$LOCAL_BIN" ]] || mkdir -p "$LOCAL_BIN" 2>/dev/null; then
   cp -f "$dest" "${LOCAL_BIN}/${BIN_NAME}"
   chmod +x "${LOCAL_BIN}/${BIN_NAME}"
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+    codesign -s - --force --timestamp=none "${LOCAL_BIN}/${BIN_NAME}" 2>/dev/null || true
+  fi
   info "copied ${LOCAL_BIN}/${BIN_NAME}"
 fi
 

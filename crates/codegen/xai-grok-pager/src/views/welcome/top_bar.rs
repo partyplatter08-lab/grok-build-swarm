@@ -57,6 +57,15 @@ pub(crate) fn location_line_at(theme: &Theme, cwd: &Path) -> Line<'static> {
     let info = git_info::cwd_git_info_lazy(cwd);
 
     let mut parts: Vec<Span> = Vec::new();
+    // Product badge so Swarm is never confused with stock Grok Build.
+    if let Some(badge) = crate::product::flavor().badge() {
+        parts.push(Span::styled(
+            format!("{badge}  "),
+            Style::default()
+                .fg(theme.accent_user)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(branch) = info.as_ref().and_then(|i| i.branch.as_deref()) {
         let icon = git_info::branch_icon();
         let git_text = if branch.is_empty() {

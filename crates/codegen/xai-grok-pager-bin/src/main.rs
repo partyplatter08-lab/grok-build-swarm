@@ -45,6 +45,7 @@ use xai_grok_shell::leader::{
     ControlPayload, LeaderClient, LeaderEnvUrls, connect_or_spawn, socket_path_for_ws_url,
 };
 use xai_grok_update::{UpdateConfig, auto_update, enforce_minimum_version_or_exit};
+use xai_grok_pager::product;
 /// Apply headless args to an existing config, only overriding values that are
 /// explicitly set. This allows environment defaults to be preserved when
 /// specific args are not provided.
@@ -1081,6 +1082,12 @@ async fn run_agent_command(
         .as_deref()
         .map(resolve_agent_profile_path);
     agent_config.client_version = Some(PAGER_CLIENT_VERSION.to_string());
+    // Swarm product: identify in the system prompt so the model (and user-
+    // visible traces) know this is not stock Grok Build.
+    if product::flavor().is_swarm() {
+        agent_config.agent.system_prompt_label =
+            Some(product::system_prompt_label(product::flavor()));
+    }
     if is_leader && !agent_args.plugin_dirs.is_empty() {
         eprintln!("{PLUGIN_DIR_LEADER_WARNING}");
     } else {
@@ -1680,6 +1687,11 @@ fn main() {
 }
 async fn async_main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // Product identity MUST be resolved before CLI parse (version/about) and
+    // before leader connect. Swarm uses an isolated leader socket so we never
+    // attach to a stock `grok` leader and silently run without fork features.
+    let product = product::init_from_env();
+    product::apply_swarm_isolation(product);
     let mut args = PagerArgs::parse_and_apply_cwd()?;
     if let Some(ref mode) = args.compaction_mode {
         unsafe { std::env::set_var("GROK_COMPACTION_MODE", mode) };
@@ -1692,6 +1704,7 @@ async fn async_main() -> Result<()> {
             std::env::set_var(xai_grok_shell::agent::chat_modes::GROK_CHAT_MODE_ENV, "1");
         }
     }
+    // Explicit --leader-socket always wins over Swarm isolation default.
     if let Some(ref socket) = args.leader_socket {
         unsafe { std::env::set_var(xai_grok_shell::leader::LEADER_SOCKET_ENV, socket) };
     }

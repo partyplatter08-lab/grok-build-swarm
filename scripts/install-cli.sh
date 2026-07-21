@@ -52,11 +52,30 @@ DEST="$PREFIX/grok-swarm"
 # Copy (not symlink) so the command keeps working if you rebuild/clean target/.
 cp -f "$SRC" "$DEST"
 chmod +x "$DEST"
+# Ad-hoc re-sign: strip/copy can invalidate the linker signature and macOS
+# then SIGKILLs the binary with "Code Signature Invalid" (looks like OOM).
+if command -v codesign >/dev/null 2>&1; then
+  codesign -s - --force --timestamp=none "$DEST" 2>/dev/null || true
+fi
 
-# Also mirror under ~/.grok/bin when present (stock grok lives there).
+# Also mirror under ~/.grok/bin + downloads when present (stock grok lives there).
 if [[ -d "$HOME/.grok/bin" ]]; then
-  cp -f "$SRC" "$HOME/.grok/bin/grok-swarm"
-  chmod +x "$HOME/.grok/bin/grok-swarm"
+  DOWNLOAD_DIR="${GROK_HOME:-$HOME/.grok}/downloads"
+  mkdir -p "$DOWNLOAD_DIR"
+  # Managed asset name used by gh-release auto-update.
+  ASSET="$DOWNLOAD_DIR/grok-swarm-0.2.106-macos-aarch64"
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64|Darwin-aarch64) ASSET="$DOWNLOAD_DIR/grok-swarm-0.2.106-macos-aarch64" ;;
+    Darwin-x86_64) ASSET="$DOWNLOAD_DIR/grok-swarm-0.2.106-macos-x86_64" ;;
+    Linux-x86_64|Linux-amd64) ASSET="$DOWNLOAD_DIR/grok-swarm-0.2.106-linux-x86_64" ;;
+    Linux-aarch64|Linux-arm64) ASSET="$DOWNLOAD_DIR/grok-swarm-0.2.106-linux-aarch64" ;;
+  esac
+  cp -f "$SRC" "$ASSET"
+  chmod +x "$ASSET"
+  if command -v codesign >/dev/null 2>&1; then
+    codesign -s - --force --timestamp=none "$ASSET" 2>/dev/null || true
+  fi
+  ln -sfn "$ASSET" "$HOME/.grok/bin/grok-swarm"
   echo "→ also installed to $HOME/.grok/bin/grok-swarm"
 fi
 

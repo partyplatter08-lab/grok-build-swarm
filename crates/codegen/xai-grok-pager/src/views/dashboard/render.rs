@@ -2691,10 +2691,14 @@ fn paint_dispatch_config_badge(
         })
         .or_else(|| {
             let name = state.models.current_model_name()?;
-            match state.models.effort_display_label() {
-                Some(label) => Some(format!("{name} ({label})")),
-                None => Some(name),
-            }
+            let base = match state.models.effort_display_label() {
+                Some(label) => format!("{name} ({label})"),
+                None => name,
+            };
+            Some(match crate::product::flavor().badge() {
+                Some(badge) => format!("{badge} · {base}"),
+                None => base,
+            })
         })
         .unwrap_or_default();
 

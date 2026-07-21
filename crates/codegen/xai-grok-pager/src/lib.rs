@@ -41,6 +41,7 @@ pub mod notifications;
 #[allow(unused_imports, unused_macros)]
 pub mod obf;
 pub mod plugin_cmd;
+pub mod product;
 pub mod project_picker;
 pub mod pty_wrap;
 pub mod scrollback;

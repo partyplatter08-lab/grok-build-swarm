@@ -1,6 +1,6 @@
 //! CLI argument parsing for the pager.
 pub use crate::headless::OutputFormat;
-use clap::{ArgAction, Parser, Subcommand, ValueHint};
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand, ValueHint};
 use clap_complete::Shell;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -403,14 +403,36 @@ fn version_with_channel() -> &'static str {
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| {
         let label = xai_grok_update::channel_label();
-        xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), label)
+        let ver =
+            xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), label);
+        // clap DisplayVersion prints `{name} {version}`; for Swarm we also
+        // stamp a clear product tag so `grok-swarm -v` is unmistakable.
+        match crate::product::flavor() {
+            crate::product::ProductFlavor::Swarm => {
+                format!("{ver} · Grok Build Swarm (Heavy/Swarm/Swarm Heavy)")
+            }
+            crate::product::ProductFlavor::Stock => ver,
+        }
     })
+    .as_str()
 }
+
+/// Product-aware about string (stock vs Swarm). Flavor must be initialized first.
+fn about_text() -> &'static str {
+    use std::sync::OnceLock;
+    static A: OnceLock<String> = OnceLock::new();
+    A.get_or_init(|| crate::product::flavor().about().to_string())
+        .as_str()
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(
+    // Name is set dynamically in parse_and_apply_cwd so `grok-swarm -v`
+    // never prints stock `grok`. Leaving it unset here would still bake the
+    // Cargo package binary name; we override at parse time.
     name = "grok",
     version = version_with_channel(),
-    about = "Grok Build TUI",
+    about = about_text(),
     disable_version_flag = true,
     next_display_order = None,
     help_template = "\
@@ -772,16 +794,43 @@ pub enum ResumeTarget {
 impl PagerArgs {
     /// Parse CLI arguments and apply `--cwd` if provided.
     pub fn parse_and_apply_cwd() -> anyhow::Result<Self> {
-        let bin_name = std::env::args()
+        // Product-aware CLI name so --help/--version and usage show `grok-swarm`
+        // when invoked as such (not stock `grok`). Versioned download names
+        // like `grok-swarm-0.2.106-macos-aarch64` normalize to `grok-swarm`.
+        let flavor = crate::product::flavor();
+        let argv0 = std::env::args()
             .next()
             .as_deref()
             .map(std::path::Path::new)
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .filter(|n| *n == "grok" || *n == "agent")
-            .unwrap_or("grok")
-            .to_owned();
-        let mut args = Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)));
+            .map(|n| n.trim_end_matches(".exe").to_string());
+        // clap::builder::Str requires `'static` — only use known static names.
+        let bin_name: &'static str = match argv0.as_deref() {
+            Some("grok") => "grok",
+            Some("agent") => "agent",
+            Some(n) if n == crate::product::SWARM_BIN_NAME || n.starts_with("grok-swarm-") => {
+                crate::product::SWARM_BIN_NAME
+            }
+            _ => flavor.bin_name(),
+        };
+        // Override clap's static `name = "grok"` / about so version and help
+        // match the product (stock vs Swarm). Without this, `grok-swarm -v`
+        // prints `grok 0.2.x` and is indistinguishable from stock.
+        let cmd = Self::command()
+            .name(bin_name)
+            .display_name(bin_name)
+            .bin_name(bin_name)
+            .about(flavor.about());
+        let matches = match cmd
+            .try_get_matches_from(std::iter::once(bin_name.to_string()).chain(std::env::args().skip(1)))
+        {
+            Ok(m) => m,
+            // Clap prints help/version itself for DisplayHelp/DisplayVersion.
+            Err(e) => e.exit(),
+        };
+        let mut args = Self::from_arg_matches(&matches)
+            .map_err(|e| anyhow::anyhow!("failed to parse CLI args: {e}"))?;
         if let Some(socket) = args.leader_socket.take() {
             args.leader_socket = Some(std::path::absolute(&socket).unwrap_or(socket));
         }

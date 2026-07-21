@@ -3938,9 +3938,18 @@ impl AppView {
                             self.tip.as_deref()
                         };
                         let model_name_base = self.models.current_model_name().unwrap_or_default();
-                        let model_name = match self.models.effort_display_label() {
-                            Some(label) => format!("{model_name_base} ({label})"),
-                            None => model_name_base,
+                        let model_name = {
+                            let effort = self.models.effort_display_label();
+                            let base = match effort {
+                                Some(label) => format!("{model_name_base} ({label})"),
+                                None => model_name_base,
+                            };
+                            // Stamp product identity into the hero so stock
+                            // vs Swarm is always visible next to the model.
+                            match crate::product::flavor().badge() {
+                                Some(badge) => format!("{badge} · {base}"),
+                                None => base,
+                            }
                         };
                         let hero_cta = crate::views::announcements::promo_cta(
                             &self.active_announcements,

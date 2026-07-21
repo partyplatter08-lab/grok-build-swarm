@@ -27,10 +27,12 @@ use xai_grok_shell::sampling::types::ReasoningEffort;
 /// A deferred model switch to apply once the session exists, plus any effort
 /// error to surface. `switch` is still populated when a `-m` model was stashed
 /// even if the effort token failed, so an invalid effort never drops the CLI
-/// model override.
+/// model override. Third field is the effort menu option id (e.g. `"heavy"`,
+/// `"swarm-heavy"`) so multi-agent modes survive when wire effort is already
+/// `xhigh` (config default).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeferredSwitchOutcome {
-    pub switch: Option<(acp::ModelId, Option<ReasoningEffort>)>,
+    pub switch: Option<(acp::ModelId, Option<ReasoningEffort>, Option<String>)>,
     pub effort_error: Option<EffortTokenError>,
 }
 /// Resolve the stashed `-m` switch and/or `cli_effort_token` against the session
@@ -42,20 +44,32 @@ pub(crate) fn take_deferred_model_switch(
     cli_effort_token: Option<&str>,
 ) -> DeferredSwitchOutcome {
     if let Some((model_id, mut effort)) = stashed {
+        let mut option_id = None;
         let effort_error = match cli_effort_token {
             Some(token) if effort.is_none() => {
                 match models.resolve_effort_for_model(&model_id, token) {
                     Ok(resolved) => {
                         effort = Some(resolved);
+                        option_id = models
+                            .resolve_effort_token_with_id_for(&model_id, token)
+                            .map(|(_, id)| id);
                         None
                     }
                     Err(err) => Some(err),
                 }
             }
+            Some(token) => {
+                // Model already stashed with an effort; still capture multi-agent
+                // option id so protocol inject + footer labels work.
+                option_id = models
+                    .resolve_effort_token_with_id_for(&model_id, token)
+                    .map(|(_, id)| id);
+                None
+            }
             _ => None,
         };
         return DeferredSwitchOutcome {
-            switch: Some((model_id, effort)),
+            switch: Some((model_id, effort, option_id)),
             effort_error,
         };
     }
@@ -72,14 +86,30 @@ pub(crate) fn take_deferred_model_switch(
         };
     };
     match models.resolve_effort_for_model(&current, token) {
-        Ok(effort) if models.reasoning_effort == Some(effort) => DeferredSwitchOutcome {
-            switch: None,
-            effort_error: None,
-        },
-        Ok(effort) => DeferredSwitchOutcome {
-            switch: Some((current, Some(effort))),
-            effort_error: None,
-        },
+        Ok(effort) => {
+            let option_id = models
+                .resolve_effort_token_with_id_for(&current, token)
+                .map(|(_, id)| id);
+            // Multi-agent tokens wire as xhigh — if config default is already
+            // xhigh we still must switch so option id + protocol inject apply.
+            let effort_unchanged = models.reasoning_effort == Some(effort);
+            let multi_agent_pending = option_id.as_deref().is_some_and(|id| {
+                use xai_grok_shell::sampling::types::OrchestrationMode;
+                OrchestrationMode::from_option_id(id).is_multi_agent()
+                    && models.reasoning_effort_option_id.as_deref() != Some(id)
+            });
+            if effort_unchanged && !multi_agent_pending {
+                DeferredSwitchOutcome {
+                    switch: None,
+                    effort_error: None,
+                }
+            } else {
+                DeferredSwitchOutcome {
+                    switch: Some((current, Some(effort), option_id)),
+                    effort_error: None,
+                }
+            }
+        }
         Err(err) => DeferredSwitchOutcome {
             switch: None,
             effort_error: Some(err),
@@ -91,7 +121,7 @@ pub(crate) fn take_deferred_model_switch(
 pub(crate) fn apply_deferred_model_switch(
     agent: &mut AgentView,
     cli_effort_token: Option<&str>,
-) -> Option<(acp::ModelId, Option<ReasoningEffort>)> {
+) -> Option<(acp::ModelId, Option<ReasoningEffort>, Option<String>)> {
     let stashed = agent.session.deferred_model_switch.take();
     let outcome = take_deferred_model_switch(stashed, &agent.session.models, cli_effort_token);
     apply_deferred_switch_outcome(agent, outcome)
@@ -100,7 +130,7 @@ pub(crate) fn apply_deferred_model_switch(
 pub(crate) fn apply_deferred_switch_outcome(
     agent: &mut AgentView,
     outcome: DeferredSwitchOutcome,
-) -> Option<(acp::ModelId, Option<ReasoningEffort>)> {
+) -> Option<(acp::ModelId, Option<ReasoningEffort>, Option<String>)> {
     if let Some(err) = outcome.effort_error {
         let msg = format!("--effort/--reasoning-effort: {}", err.message());
         tracing::warn!("{msg}");
@@ -862,13 +892,13 @@ pub(in crate::app::dispatch) fn handle_session_created(
             agent_id,
             silent: true,
         });
-        if let Some((model_id, effort)) = deferred {
+        if let Some((model_id, effort, effort_option_id)) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,
                 session_id: session_id_clone.clone(),
                 model_id,
                 effort,
-                effort_option_id: None,
+                effort_option_id,
                 prev_model_id: None,
             });
         }
@@ -958,13 +988,13 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             agent_id,
             silent: true,
         });
-        if let Some((model_id, effort)) = deferred {
+        if let Some((model_id, effort, effort_option_id)) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,
                 session_id: session_id_clone.clone(),
                 model_id,
                 effort,
-                effort_option_id: None,
+                effort_option_id,
                 prev_model_id: None,
             });
         }
