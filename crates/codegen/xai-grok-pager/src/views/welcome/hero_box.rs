@@ -28,14 +28,23 @@ const LOGO_H_PAD: u16 = 3;
 /// message never paints over the button.
 const UPGRADE_CTA_ROWS: u16 = 2;
 
-const HERO_SUBTITLE: &str = "Thanks for trying Grok Build, give feedback with /feedback!";
+fn hero_subtitle() -> &'static str {
+    crate::product::flavor().splash_subtitle()
+}
 
 use super::{PROMPT_HEIGHT, VERSION_GAP};
 
-/// Rows the "thanks" subtitle occupies. Hidden when the in-box info slot
-/// (changelog / announcement) is shown, to keep the box compact.
+/// Rows the product subtitle occupies. Stock hides it when the in-box info
+/// slot (changelog / announcement) is shown, to keep the box compact. Swarm
+/// always keeps one row so the multi-agent tagline is part of the splash.
 fn subtitle_rows(info_height: u16) -> u16 {
-    if info_height > 0 { 0 } else { 1 }
+    if crate::product::flavor().is_swarm() {
+        1
+    } else if info_height > 0 {
+        0
+    } else {
+        1
+    }
 }
 
 /// Height of the hero box's right column: version + optional subtitle +
@@ -334,7 +343,7 @@ pub(super) fn render_hero_box(
         buf.set_span(
             layout.hero_subtitle.x,
             layout.hero_subtitle.y,
-            &Span::styled(HERO_SUBTITLE, subtitle_style),
+            &Span::styled(hero_subtitle(), subtitle_style),
             layout.hero_subtitle.width,
         );
     }

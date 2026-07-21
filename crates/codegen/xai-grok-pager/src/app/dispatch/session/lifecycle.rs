@@ -1105,19 +1105,30 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 let unchanged = prev_model.as_ref() == Some(&model_id)
                     && prev_effort == resolved_effort
                     && prev_option == resolved_option;
-                if !unchanged {
+                // Multi-agent modes share wire xhigh — always confirm when the
+                // option id (or mode) actually changed, even if wire effort did not.
+                let mode = agent.session.models.orchestration_mode();
+                let should_announce = !unchanged
+                    || (mode.is_multi_agent()
+                        && prev_option.as_deref() != resolved_option.as_deref());
+                if should_announce {
                     let effort_label = agent
                         .session
                         .models
                         .effort_display_label()
                         .or_else(|| resolved_effort.map(|e| e.to_string()));
-                    let msg = if let Some(label) = effort_label {
-                        format!("Switched to {display_name} ({label} effort)")
-                    } else {
-                        format!("Switched to {display_name}")
+                    let msg = match effort_label.as_deref() {
+                        Some(label) => format!("Switched to {display_name} ({label})"),
+                        None => format!("Switched to {display_name}"),
                     };
                     agent.scrollback.push_block(RenderBlock::system(msg));
-                    let mode = agent.session.models.orchestration_mode();
+                    let toast = match (mode.is_multi_agent(), effort_label.as_deref()) {
+                        (true, Some(label)) => format!("{} · {label}", mode.mark()),
+                        (true, None) => mode.mark().to_string(),
+                        (false, Some(label)) => format!("Effort: {label}"),
+                        (false, None) => "Model switched".to_string(),
+                    };
+                    agent.show_toast(&toast);
                     if mode.is_multi_agent() {
                         if let Some(banner) = mode.open_banner() {
                             agent
@@ -1125,7 +1136,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                                 .push_block(RenderBlock::system(banner.to_string()));
                         }
                         agent.scrollback.push_block(RenderBlock::system(format!(
-                            "{} mode active — multi-agent orchestration protocol loaded.                              Workers will appear as {}rows. Depth limit is 1 (only you spawn).",
+                            "{} mode active — multi-agent orchestration protocol loaded. Workers will appear as {}rows. Depth limit is 1 (only you spawn).",
                             mode.mark(),
                             mode.subagent_chrome(),
                         )));

@@ -2207,8 +2207,10 @@ impl AgentView {
         let usage_warning_text: Option<String> = warning.as_ref().map(|(t, _)| t.clone());
         let usage_warning = usage_warning_text.as_deref();
         let usage_warning_critical = warning.is_some_and(|(_, critical)| critical);
-        let model_label = match self.session.models.reasoning_effort {
-            Some(eff) => format!("{model_id} ({eff})"),
+        // Prefer menu option labels (Heavy / Agent Swarm / Swarm Heavy) over the
+        // wire effort token — multi-agent modes all wire as xhigh.
+        let model_label = match self.session.models.effort_display_label() {
+            Some(label) => format!("{model_id} ({label})"),
             None => model_id,
         };
         let info = match &self.prompt_mode {

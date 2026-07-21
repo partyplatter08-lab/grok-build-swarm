@@ -844,18 +844,18 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             };
             let Some(session_id) = agent.session.session_id.clone() else {
                 agent.session.deferred_model_switch = Some((model_id, effort));
+                // Stash option id for display / deferred apply without a live session.
                 if let Some(oid) = effort_option_id {
                     agent.session.models.reasoning_effort_option_id = Some(oid);
                 }
                 return vec![];
             };
             agent.session.model_switch_pending = true;
-            if let Some(ref oid) = effort_option_id {
-                agent.session.models.reasoning_effort_option_id = Some(oid.clone());
-            }
-            if let Some(eff) = effort {
-                agent.session.models.reasoning_effort = Some(eff);
-            }
+            // Do NOT optimistically overwrite reasoning_effort / option_id here.
+            // handle_switch_model_complete compares prev vs resolved to decide
+            // whether to show the switch toast + multi-agent banners. Pre-writing
+            // made Heavy/Swarm (wire-xhigh) look "unchanged" so confirmation never
+            // appeared when config default was already xhigh.
             vec![Effect::SwitchModel {
                 agent_id: id,
                 session_id,

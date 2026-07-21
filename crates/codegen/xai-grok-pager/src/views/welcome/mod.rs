@@ -378,11 +378,11 @@ impl WelcomeLayout {
 
 /// Controls what the version badge renders.
 pub(super) enum VersionBadgeMode<'a> {
-    /// Full badge: team | tier | api_key | **Grok Build** VERSION+channel **Beta** (right-aligned).
+    /// Full badge: team | tier | api_key | **brand** VERSION+channel **suffix** (right-aligned).
     Full { subscription_tier: Option<&'a str> },
-    /// Hero footer: team | api_key | Grok Build Beta [channel] (right-aligned, gray).
+    /// Hero footer: team | api_key | channel / product tag (right-aligned, gray).
     HeroFooter,
-    /// Hero inline: **Grok Build Beta**  VERSION (left-aligned).
+    /// Hero inline: **splash title**  VERSION (left-aligned).
     HeroInline,
 }
 
@@ -404,6 +404,7 @@ pub(super) fn render_version_badge(
         Style::default().fg(theme.gray).add_modifier(Modifier::DIM),
     );
     let mut spans = Vec::new();
+    let product = crate::product::flavor();
 
     let (show_team, show_tier, show_api_key, align) = match &mode {
         VersionBadgeMode::Full { .. } => (true, true, true, Alignment::Right),
@@ -438,7 +439,7 @@ pub(super) fn render_version_badge(
     match &mode {
         VersionBadgeMode::Full { .. } => {
             spans.push(Span::styled(
-                "Grok Build  ",
+                format!("{}  ", product.splash_brand()),
                 Style::default()
                     .fg(theme.text_primary)
                     .add_modifier(Modifier::BOLD),
@@ -448,14 +449,20 @@ pub(super) fn render_version_badge(
                 Style::default().fg(theme.gray),
             ));
             spans.push(Span::styled(
-                " Beta",
+                product.splash_channel_suffix(),
                 Style::default()
-                    .fg(theme.text_primary)
+                    .fg(if product.is_swarm() {
+                        theme.accent_user
+                    } else {
+                        theme.text_primary
+                    })
                     .add_modifier(Modifier::BOLD),
             ));
         }
         VersionBadgeMode::HeroFooter => {
-            let channel_display = if channel.is_empty() {
+            let channel_display = if product.is_swarm() {
+                "Swarm"
+            } else if channel.is_empty() {
                 "Beta"
             } else {
                 channel.trim()
@@ -467,9 +474,13 @@ pub(super) fn render_version_badge(
         }
         VersionBadgeMode::HeroInline => {
             spans.push(Span::styled(
-                "Grok Build Beta  ",
+                format!("{}  ", product.splash_title()),
                 Style::default()
-                    .fg(theme.text_primary)
+                    .fg(if product.is_swarm() {
+                        theme.accent_user
+                    } else {
+                        theme.text_primary
+                    })
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(

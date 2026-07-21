@@ -66,6 +66,40 @@ impl ProductFlavor {
     pub fn version_prefix(self) -> &'static str {
         self.bin_name()
     }
+
+    /// Hero / splash title (left of version on the welcome panel).
+    pub fn splash_title(self) -> &'static str {
+        match self {
+            Self::Stock => "Grok Build Beta",
+            Self::Swarm => "Grok Build Swarm",
+        }
+    }
+
+    /// Compact product mark used in full version badges (`Grok Build` / `Grok Swarm`).
+    pub fn splash_brand(self) -> &'static str {
+        match self {
+            Self::Stock => "Grok Build",
+            Self::Swarm => "Grok Swarm",
+        }
+    }
+
+    /// Secondary line under the splash title (modes / feedback).
+    pub fn splash_subtitle(self) -> &'static str {
+        match self {
+            Self::Stock => "Thanks for trying Grok Build, give feedback with /feedback!",
+            Self::Swarm => {
+                "Heavy · Agent Swarm · Swarm Heavy — multi-agent modes · /effort to switch"
+            }
+        }
+    }
+
+    /// Channel / tier suffix next to the brand in full badges (` Beta` / ` Swarm`).
+    pub fn splash_channel_suffix(self) -> &'static str {
+        match self {
+            Self::Stock => " Beta",
+            Self::Swarm => " · Multi-agent",
+        }
+    }
 }
 
 /// Detect product from the binary invocation name (argv0).
