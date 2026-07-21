@@ -2722,12 +2722,14 @@ fn paint_dispatch_config_badge(
         return;
     }
 
+    let orch = state.models.orchestration_mode();
     let info = PromptInfo {
         model_name: &model_label,
         flags: &flags,
         multiline: state.multiline_mode,
         usage_warning: None,
         usage_warning_critical: false,
+        orchestration_mode: orch,
     };
     // Bottom border row, inside the corners — the same content rect the chat
     // prompt uses for its info line.

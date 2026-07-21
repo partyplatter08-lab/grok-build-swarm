@@ -85,17 +85,34 @@ fn build_flat_lines(
 
         let is_selected = idx == selected;
         let is_hovered = hovered == Some(idx) && !is_selected;
-        let row_bg = match crate::views::modal_window::embedded_row_style(theme, is_selected) {
-            Some(e) => e.bg,
-            None if is_selected => theme.bg_visual,
-            None if is_hovered => hover_bg,
-            None => theme.bg_light,
+        // Multi-agent effort rows (Heavy / Swarm / Swarm Heavy): colored wash
+        // on hover + selection so higher efforts feel alive in the menu.
+        let mode = crate::views::orchestration_visuals::mode_from_effort_token(&item.insert_text);
+        let row_bg = if mode.is_multi_agent() {
+            if is_selected {
+                crate::views::orchestration_visuals::mode_selected_bg(mode, theme)
+                    .unwrap_or(theme.bg_visual)
+            } else if is_hovered {
+                crate::views::orchestration_visuals::mode_hover_bg(mode, theme)
+                    .unwrap_or(hover_bg)
+            } else {
+                theme.bg_light
+            }
+        } else {
+            match crate::views::modal_window::embedded_row_style(theme, is_selected) {
+                Some(e) => e.bg,
+                None if is_selected => theme.bg_visual,
+                None if is_hovered => hover_bg,
+                None => theme.bg_light,
+            }
         };
 
         build_item_lines(
             &mut flat,
             item,
             is_selected,
+            is_hovered || is_selected,
+            mode,
             label_col_w,
             row_w,
             row_bg,
@@ -269,6 +286,8 @@ fn build_item_lines(
     out: &mut Vec<Line<'static>>,
     item: &SuggestionRow,
     is_selected: bool,
+    emphasized: bool,
+    mode: xai_grok_shell::sampling::types::OrchestrationMode,
     label_col_w: usize,
     total_w: usize,
     row_bg: ratatui::style::Color,
@@ -289,7 +308,23 @@ fn build_item_lines(
         .bg(row_bg)
         .add_modifier(bold);
     let match_style = Style::default().fg(match_fg).bg(row_bg).add_modifier(bold);
-    let desc_style = Style::default().fg(desc_fg).bg(row_bg);
+    // Multi-agent descriptions take a soft tint of the mode accent when live.
+    let desc_style = if mode.is_multi_agent() && emphasized {
+        if let Some(accent) =
+            crate::views::orchestration_visuals::mode_base_color(mode)
+        {
+            Style::default()
+                .fg(
+                    crate::render::color::blend_color(theme.gray, accent, 0.45)
+                        .unwrap_or(theme.gray),
+                )
+                .bg(row_bg)
+        } else {
+            Style::default().fg(desc_fg).bg(row_bg)
+        }
+    } else {
+        Style::default().fg(desc_fg).bg(row_bg)
+    };
     let bg_style = Style::default().bg(row_bg);
 
     // 1. Build prefix + label spans with fuzzy match highlighting.
@@ -298,17 +333,32 @@ fn build_item_lines(
     } else {
         "  "
     };
-    let prefix_span = Span::styled(
-        prefix.to_string(),
-        if is_selected { normal_style } else { bg_style },
-    );
+    let prefix_style = if mode.is_multi_agent() && (is_selected || emphasized) {
+        crate::views::orchestration_visuals::mode_label_style(mode, theme, true, row_bg)
+    } else if is_selected {
+        normal_style
+    } else {
+        bg_style
+    };
+    let prefix_span = Span::styled(prefix.to_string(), prefix_style);
 
     let label = truncate_str(&item.display, label_col_w);
     let label_w = label.width();
     let padding = label_col_w.saturating_sub(label_w);
 
-    // Build per-character spans for the label with fuzzy highlight.
-    let label_spans = build_highlighted_spans(&label, &item.indices, normal_style, match_style);
+    // Multi-agent: per-glyph color (rainbow for Swarm Heavy, solid pulse for
+    // Heavy/Swarm). Single-agent: fuzzy match highlight as before.
+    let label_spans = if mode.is_multi_agent() {
+        crate::views::orchestration_visuals::mode_label_spans(
+            &label,
+            mode,
+            theme,
+            emphasized,
+            row_bg,
+        )
+    } else {
+        build_highlighted_spans(&label, &item.indices, normal_style, match_style)
+    };
 
     // Description column indent (prefix + label + gap).
     let desc_indent = PREFIX_W + label_col_w + LABEL_DESC_GAP;

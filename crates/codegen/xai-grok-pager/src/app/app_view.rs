@@ -5017,7 +5017,23 @@ impl AppView {
                 let Some(agent) = self.agents.get(&id) else {
                     return TickDemand::None;
                 };
+                // Multi-agent footer/chip rainbow + solid pulse need redraws
+                // while Heavy / Swarm / Swarm Heavy is active, and while the
+                // /effort dropdown is open on those rows (Claude ultrathink feel).
+                let multi_agent_anim = crate::views::orchestration_visuals::needs_multi_agent_animation(
+                    agent.session.models.orchestration_mode(),
+                ) || {
+                    let snap = agent.prompt.slash_controller.snapshot();
+                    snap.open
+                        && snap.matches.iter().any(|m| {
+                            crate::views::orchestration_visuals::mode_from_effort_token(
+                                &m.insert_text,
+                            )
+                            .is_multi_agent()
+                        })
+                };
                 let fast = agent.scrollback.needs_animation()
+                    || multi_agent_anim
                     || agent.todo.list_state.needs_tick()
                     || agent.todo.badge_needs_tick()
                     || agent.tasks.needs_tick()

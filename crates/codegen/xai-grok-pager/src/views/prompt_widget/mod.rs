@@ -291,6 +291,8 @@ pub struct PromptInfo<'a> {
     /// When true the warning uses the yellow warning color (<=5% left);
     /// when false it uses dim grey text (5-10% left).
     pub usage_warning_critical: bool,
+    /// Active multi-agent mode — colors the model chip (red / purple / rainbow).
+    pub orchestration_mode: xai_grok_shell::sampling::types::OrchestrationMode,
 }
 
 /// Live voice-capture overlay state for the prompt.
@@ -3348,7 +3350,19 @@ impl PromptWidget {
             left_spans.push(Span::styled(warning.to_owned(), warning_style));
             left_spans.push(Span::styled(" · ", sep_style));
         }
-        left_spans.push(Span::styled(info.model_name, model_style));
+        // Multi-agent modes: alive model chip (Heavy red, Swarm purple,
+        // Swarm Heavy rainbow shimmer — Claude ultrathink energy).
+        if info.orchestration_mode.is_multi_agent() {
+            left_spans.extend(crate::views::orchestration_visuals::mode_label_spans(
+                info.model_name,
+                info.orchestration_mode,
+                theme,
+                true,
+                bg,
+            ));
+        } else {
+            left_spans.push(Span::styled(info.model_name, model_style));
+        }
         for flag in info.flags {
             left_spans.push(Span::styled(" · ", sep_style));
             let mut style = if let Some(color) = flag.color {

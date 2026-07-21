@@ -81,6 +81,7 @@ mod tests {
             multiline: false,
             usage_warning: None,
             usage_warning_critical: false,
+            orchestration_mode: xai_grok_shell::sampling::types::OrchestrationMode::Normal,
         };
 
         let (_, post_flush) = render_prompt(

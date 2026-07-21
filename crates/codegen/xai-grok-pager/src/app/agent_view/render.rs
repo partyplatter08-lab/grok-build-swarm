@@ -2209,7 +2209,11 @@ impl AgentView {
         let usage_warning_critical = warning.is_some_and(|(_, critical)| critical);
         // Prefer menu option labels (Heavy / Agent Swarm / Swarm Heavy) over the
         // wire effort token — multi-agent modes all wire as xhigh.
+        let orch_mode = self.session.models.orchestration_mode();
         let model_label = match self.session.models.effort_display_label() {
+            Some(label) if orch_mode.is_multi_agent() => {
+                format!("{} · {model_id} ({label})", orch_mode.mark())
+            }
             Some(label) => format!("{model_id} ({label})"),
             None => model_id,
         };
@@ -2220,6 +2224,7 @@ impl AgentView {
                 multiline,
                 usage_warning,
                 usage_warning_critical,
+                orchestration_mode: orch_mode,
             },
             PromptMode::EditingQueued { id, .. } => {
                 let pos = self.session.queue_position(*id).map(|i| i + 1).unwrap_or(1);
@@ -2230,6 +2235,7 @@ impl AgentView {
                     multiline,
                     usage_warning,
                     usage_warning_critical,
+                    orchestration_mode: orch_mode,
                 }
             }
         };
@@ -2240,6 +2246,7 @@ impl AgentView {
                 multiline: false,
                 usage_warning,
                 usage_warning_critical,
+                orchestration_mode: orch_mode,
             }
         } else {
             info

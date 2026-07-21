@@ -88,8 +88,16 @@ pub(crate) fn build_effort_arg_items_with_option_id(
             let active_suffix = if active { " (active)" } else { "" };
             let insert_text = insert_text_for(option);
             let sort_prefix = char::from(b'a' + idx as u8);
+            // Multi-agent rows get a brand mark so the dropdown feels distinct
+            // from plain high/medium (and pairs with colored hover styles).
+            let mode = OrchestrationMode::from_option_id(&option.id);
+            let label = if mode.is_multi_agent() {
+                format!("{} {}{active_suffix}", mode.mark(), option.label)
+            } else {
+                format!("{}{active_suffix}", option.label)
+            };
             ArgItem {
-                display: format!("{}{active_suffix}", option.label),
+                display: label,
                 match_text: format!("{sort_prefix} {insert_text}"),
                 insert_text,
                 description: option.description.clone().unwrap_or_default(),

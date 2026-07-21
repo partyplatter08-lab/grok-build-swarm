@@ -187,11 +187,21 @@ impl BlockContent for SubagentBlock {
 
         // Multi-agent chrome: detect [Council/], [Swarm/], [SH/] tags so rows
         // never look like a generic "Subagent" when Heavy/Swarm is running.
-        let chrome = xai_grok_shell::sampling::types::mode_from_subagent_description(
+        // Colored like the effort menu (red / purple / rainbow).
+        let orch_mode = xai_grok_shell::sampling::types::mode_from_subagent_description(
             &self.description,
-        )
-        .subagent_chrome();
+        );
+        let chrome = orch_mode.subagent_chrome();
         let chrome_width = chrome.width();
+        let chrome_style = if orch_mode.is_multi_agent() {
+            crate::views::orchestration_visuals::mode_chrome_style(
+                orch_mode,
+                &theme,
+                ctx.is_selected,
+            )
+        } else {
+            bold
+        };
 
         let line = match (&self.kind, self.is_background) {
             (SubagentBlockKind::Started, bg) => {
@@ -210,11 +220,24 @@ impl BlockContent for SubagentBlock {
                 // chrome + "running: "/"started: " (= 9 chars for either verb)
                 let overhead = chrome_width + 9 + meta.width() + activity_suffix.width();
                 let desc = quoted_desc(&self.description, w.saturating_sub(overhead));
-                let mut spans = vec![
-                    Span::styled(chrome, bold),
-                    Span::styled(verb, muted),
-                    Span::styled(desc, muted),
-                ];
+                let mut spans = if orch_mode.is_multi_agent() {
+                    let mut s = crate::views::orchestration_visuals::mode_label_spans(
+                        chrome,
+                        orch_mode,
+                        &theme,
+                        true,
+                        theme.bg_base,
+                    );
+                    s.push(Span::styled(verb, muted));
+                    s.push(Span::styled(desc, muted));
+                    s
+                } else {
+                    vec![
+                        Span::styled(chrome, chrome_style),
+                        Span::styled(verb, muted),
+                        Span::styled(desc, muted),
+                    ]
+                };
                 if !activity_suffix.is_empty() {
                     spans.push(Span::styled(activity_suffix, muted));
                 }
@@ -226,7 +249,7 @@ impl BlockContent for SubagentBlock {
                 let prefix_len = chrome_width + 17 + time_str.len();
                 let desc = quoted_desc(&self.description, w.saturating_sub(prefix_len));
                 Line::from(vec![
-                    Span::styled(chrome, bold),
+                    Span::styled(chrome, chrome_style),
                     Span::styled(format!("completed in {time_str}: "), muted),
                     Span::styled(desc, muted),
                 ])
@@ -240,7 +263,7 @@ impl BlockContent for SubagentBlock {
                 let prefix_len = chrome_width + 12 + time_str.len() + detail.len();
                 let desc = quoted_desc(&self.description, w.saturating_sub(prefix_len));
                 Line::from(vec![
-                    Span::styled(chrome, bold),
+                    Span::styled(chrome, chrome_style),
                     Span::styled(format!("failed in {time_str}{detail}: "), muted),
                     Span::styled(desc, muted),
                 ])
@@ -250,7 +273,7 @@ impl BlockContent for SubagentBlock {
                 let prefix_len = chrome_width + 17 + time_str.len();
                 let desc = quoted_desc(&self.description, w.saturating_sub(prefix_len));
                 Line::from(vec![
-                    Span::styled(chrome, bold),
+                    Span::styled(chrome, chrome_style),
                     Span::styled(format!("cancelled in {time_str}: "), muted),
                     Span::styled(desc, muted),
                 ])
