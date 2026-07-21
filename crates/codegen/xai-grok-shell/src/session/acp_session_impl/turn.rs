@@ -281,6 +281,22 @@ impl SessionActor {
                 .handle_direct_bash_command(prompt_id, bash_command, &prompt_blocks)
                 .await;
         }
+        // Code-enforced Heavy / Swarm Heavy pipeline: Research → Implement → Test
+        // as real subagents (not prompt-only orchestration).
+        if !origin.is_synthetic() && self.should_run_heavy_pipeline().await {
+            let user_text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
+                if let acp::ContentBlock::Text(t) = b {
+                    if !acc.is_empty() {
+                        acc.push('\n');
+                    }
+                    acc.push_str(&t.text);
+                }
+                acc
+            });
+            if !user_text.trim().is_empty() {
+                return self.run_heavy_pipeline(prompt_id, user_text.trim()).await;
+            }
+        }
         let slash_skills = self
             .agent
             .borrow()

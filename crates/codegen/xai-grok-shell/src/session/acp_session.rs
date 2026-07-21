@@ -92,6 +92,8 @@ mod compaction_segments;
 mod types;
 pub(crate) use types::*;
 pub use types::{TodoGateDecision, TodoGateReason};
+#[path = "heavy_pipeline.rs"]
+mod heavy_pipeline;
 #[path = "acp_session_impl/goal.rs"]
 mod goal;
 #[path = "acp_session_impl/interjection.rs"]
