@@ -517,6 +517,26 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     // carry an owned String (see find_session_match docs).
                     let child_key: &str = notif.request.session_id.0.as_ref();
 
+                    // Capture thought/message text before move so we can mirror
+                    // into the parent feed (Heavy board without opening cards).
+                    let mirror_thought = match &notif.request.update {
+                        acp::SessionUpdate::AgentThoughtChunk(chunk) => {
+                            content_block_text(&chunk.content)
+                        }
+                        _ => None,
+                    };
+                    let mirror_message = match &notif.request.update {
+                        acp::SessionUpdate::AgentMessageChunk(chunk) => {
+                            content_block_text(&chunk.content)
+                        }
+                        _ => None,
+                    };
+                    let worker_label = parent
+                        .subagent_sessions
+                        .get(child_key)
+                        .map(|info| short_worker_label(info.description.as_ref()))
+                        .unwrap_or_else(|| "Worker".to_string());
+
                     let activity_label = {
                         let child_view = parent
                             .subagent_views
@@ -540,6 +560,32 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     };
 
                     sync_subagent_activity(parent, child_key, activity_label);
+
+                    // Stream worker thinking (and short answer chunks) into the
+                    // parent timeline so Heavy mode is watchable live.
+                    if let Some(text) = mirror_thought.filter(|t| !t.trim().is_empty()) {
+                        let labeled = format!("[{worker_label}] {text}");
+                        let _ = parent.session.tracker.handle_update(
+                            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+                                acp::ContentBlock::Text(acp::TextContent::new(labeled)),
+                            )),
+                            &meta,
+                            &mut parent.scrollback,
+                        );
+                    } else if let Some(text) = mirror_message.filter(|t| {
+                        let t = t.trim();
+                        // Skip huge dumps; full body still in worker card.
+                        !t.is_empty() && t.chars().count() <= 800
+                    }) {
+                        let labeled = format!("[{worker_label}] {text}");
+                        let _ = parent.session.tracker.handle_update(
+                            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                acp::ContentBlock::Text(acp::TextContent::new(labeled)),
+                            )),
+                            &meta,
+                            &mut parent.scrollback,
+                        );
+                    }
 
                     is_active
                 }
@@ -666,6 +712,32 @@ fn handle_interjection(notif: &acp::ExtNotification, app: &mut AppView) -> bool 
     // emits the queue-emptying `x.ai/queue/changed` right after it).
     agent.suppress_parked_marker_on_interject();
     is_active
+}
+
+/// Text from an ACP content block (thought / message chunks).
+fn content_block_text(content: &acp::ContentBlock) -> Option<String> {
+    match content {
+        acp::ContentBlock::Text(t) => Some(t.text.clone()),
+        _ => None,
+    }
+}
+
+/// Short label for parent-feed mirrors: `Council/Analyst` or `Pipeline/Research`.
+fn short_worker_label(description: &str) -> String {
+    if let Some(rest) = description.strip_prefix('[')
+        && let Some(close) = rest.find(']')
+    {
+        let tag = rest[..close].trim();
+        if !tag.is_empty() {
+            return tag.to_string();
+        }
+    }
+    let first: String = description.chars().take(28).collect();
+    if first.is_empty() {
+        "Worker".into()
+    } else {
+        first
+    }
 }
 
 /// Handle an ACP `ext_method` request (blocking request that expects a response).
