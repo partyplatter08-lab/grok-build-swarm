@@ -785,14 +785,38 @@ async fn apply_headless_model_and_effort(
         return Ok(());
     }
 
-    let meta = effort.map(|eff| {
-        let mut m = acp::Meta::new();
+    // Include orchestration mode option id so the shell injects Heavy/Swarm
+    // protocol into the system prompt (not just the wire xhigh effort).
+    let mut m = acp::Meta::new();
+    if let Some(eff) = effort {
         m.insert(
             REASONING_EFFORT_META_KEY.to_string(),
             reasoning_effort_meta_value(eff),
         );
-        m
-    });
+    }
+    if let Some(token) = effort_token {
+        use xai_grok_shell::sampling::types::{
+            ORCHESTRATION_MODE_META_KEY, OrchestrationMode,
+        };
+        let mode = OrchestrationMode::from_option_id(token);
+        if mode.is_multi_agent() {
+            m.insert(
+                ORCHESTRATION_MODE_META_KEY.to_string(),
+                serde_json::Value::String(
+                    mode.option_id().unwrap_or(token).to_string(),
+                ),
+            );
+        } else if let Some((_, oid)) = models.resolve_effort_token_with_id(token) {
+            let mode = OrchestrationMode::from_option_id(&oid);
+            if mode.is_multi_agent() {
+                m.insert(
+                    ORCHESTRATION_MODE_META_KEY.to_string(),
+                    serde_json::Value::String(oid),
+                );
+            }
+        }
+    }
+    let meta = if m.is_empty() { None } else { Some(m) };
 
     acp_send(
         acp::SetSessionModelRequest::new(session_id.clone(), model_id.clone()).meta(meta),
