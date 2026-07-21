@@ -5023,7 +5023,7 @@ impl AppView {
                 let multi_agent_anim = crate::views::orchestration_visuals::needs_multi_agent_animation(
                     agent.session.models.orchestration_mode(),
                 ) || {
-                    let snap = agent.prompt.slash_controller.snapshot();
+                    let snap = agent.prompt.slash_state.snapshot();
                     snap.open
                         && snap.matches.iter().any(|m| {
                             crate::views::orchestration_visuals::mode_from_effort_token(
