@@ -1094,12 +1094,60 @@ async fn wait_for_pid_exit(pid: u32, timeout: Duration) {
     );
 }
 /// Whether the leader on `conn` is below this client's version floor (see
-/// [`should_evict`]).
-fn should_evict_conn(conn: &LeaderConnection) -> bool {
-    should_evict(
+/// [`should_evict`]), or is the wrong product (stock `grok` on a Swarm client).
+///
+/// `leader_pid` comes from the lock file when available (registration does not
+/// carry a pid).
+fn should_evict_conn(conn: &LeaderConnection, leader_pid: Option<u32>) -> bool {
+    if should_evict(
         conn.registration().leader_binary_version.as_deref(),
         CLIENT_LEADER_VERSION,
-    )
+    ) {
+        return true;
+    }
+    // Swarm clients must never adopt a stock-grok leader process. That leader
+    // shares the version string but has no Heavy/Swarm pipeline — sessions look
+    // multi-agent in the TUI and behave as single-agent.
+    if client_is_swarm_product() {
+        if let Some(pid) = leader_pid {
+            if process_looks_like_stock_grok_leader(pid) {
+                tracing::warn!(
+                    pid,
+                    "evicting stock grok leader — swarm client needs grok-swarm leader"
+                );
+                return true;
+            }
+        }
+    }
+    false
+}
+/// Whether this client process is Grok Build Swarm (by argv0 / current_exe name).
+fn client_is_swarm_product() -> bool {
+    exe_looks_like_swarm(std::env::current_exe().ok().as_deref())
+}
+/// Best-effort: true when `pid` is clearly the stock `grok agent leader` binary
+/// (path contains `/grok` or `\grok` as the leaf, not `grok-swarm`).
+fn process_looks_like_stock_grok_leader(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let args = String::from_utf8_lossy(&output.stdout);
+    let args = args.trim();
+    if args.is_empty() {
+        return false;
+    }
+    // Swarm leader: ".../grok-swarm agent leader" or versioned "grok-swarm-…".
+    if args.contains("grok-swarm") {
+        return false;
+    }
+    // Stock: ".../grok agent leader" (leaf `grok`, not grok-swarm).
+    args.contains("agent leader") || args.contains("agent\tleader")
 }
 /// Ask a stale leader to vacate so it releases the flock: graceful
 /// `RelaunchForUpdate` if relaunch-capable (the leader dedupes concurrent
@@ -1228,7 +1276,7 @@ pub async fn connect_or_spawn(
         if !skip_connect {
             match connect_to_leader(&sock_path, client_type, mode, capabilities.clone()).await {
                 Ok(conn) => {
-                    if !should_evict_conn(&conn) {
+                    if !should_evict_conn(&conn, lock.read_pid()) {
                         info!(
                             elapsed_ms = start.elapsed().as_millis() as u64,
                             "Adopted leader"
@@ -1252,7 +1300,7 @@ pub async fn connect_or_spawn(
                     && let Ok(conn) =
                         connect_to_leader(&sock_path, client_type, mode, capabilities.clone()).await
                 {
-                    if !should_evict_conn(&conn) {
+                    if !should_evict_conn(&conn, lock.read_pid()) {
                         if let Err(e) = lock.release() {
                             warn!(
                                 error = % e, "Failed to release lock after adopting leader"
@@ -1312,7 +1360,7 @@ pub async fn connect_or_spawn(
         match wait_for_socket_connectable(&sock_path, client_type, mode, capabilities.clone()).await
         {
             Ok(conn) => {
-                if !should_evict_conn(&conn) {
+                if !should_evict_conn(&conn, lock.read_pid()) {
                     info!(
                         elapsed_ms = start.elapsed().as_millis() as u64,
                         "Adopted leader"
@@ -1336,34 +1384,72 @@ pub async fn connect_or_spawn(
 /// Resolve the binary to spawn as the leader subprocess.
 ///
 /// For a **managed install** — the running binary lives under `grok_home`
-/// (e.g. `~/.grok/...`) — prefer the managed `~/.grok/bin/grok` symlink. After an
-/// auto-update or `grok update` atomically swaps that symlink, `current_exe()`
-/// still resolves (via `/proc/self/exe` on Linux) to the *old* versioned target,
-/// so spawning it would relaunch the stale binary. The symlink always points to
-/// the freshly-installed version. This mirrors
+/// (e.g. `~/.grok/...`) — prefer the managed product symlink
+/// (`~/.grok/bin/grok` or `~/.grok/bin/grok-swarm`). After an auto-update
+/// atomically swaps that symlink, `current_exe()` still resolves (via
+/// `/proc/self/exe` on Linux) to the *old* versioned target, so spawning it
+/// would relaunch the stale binary. The symlink always points to the
+/// freshly-installed version. This mirrors
 /// `xai_grok_update::auto_update::resolve_restart_exe`.
+///
+/// **Product isolation:** `grok-swarm` must spawn `~/.grok/bin/grok-swarm`, not
+/// stock `grok`. Spawning stock as the leader on `leader-swarm.sock` runs a
+/// binary without Heavy/Swarm pipeline code — sessions look multi-agent in the
+/// TUI but act single-agent.
 ///
 /// For a **dev / out-of-tree binary** (`cargo run`, integration tests, installs
 /// not under `grok_home`), keep `current_exe()` so the spawned leader matches the
 /// calling binary.
 ///
-/// Falls back to `~/.grok/bin/grok` only when `current_exe()` is unavailable.
+/// Falls back to the product-matched managed bin when `current_exe()` is
+/// unavailable.
 fn resolve_exe_for_spawn() -> Result<std::path::PathBuf, ConnectionError> {
     resolve_binary_with_home(&crate::util::grok_home::grok_home())
 }
 fn resolve_binary_with_home(grok_home: &Path) -> Result<std::path::PathBuf, ConnectionError> {
     resolve_binary_impl(grok_home, std::env::current_exe().ok())
 }
-/// Binary file name for the managed grok install (`grok` / `grok.exe`).
+/// Binary file name for the stock managed install (`grok` / `grok.exe`).
 fn managed_grok_bin_name() -> &'static str {
     if cfg!(windows) { "grok.exe" } else { "grok" }
+}
+/// Managed bin name for the product that matches `current_exe`.
+///
+/// Detects Swarm from the leaf name even when `current_exe` is a versioned
+/// download target (`grok-swarm-0.2.106-macos-aarch64`).
+fn managed_bin_name_for_exe(current_exe: Option<&Path>) -> &'static str {
+    if exe_looks_like_swarm(current_exe) {
+        if cfg!(windows) {
+            "grok-swarm.exe"
+        } else {
+            "grok-swarm"
+        }
+    } else {
+        managed_grok_bin_name()
+    }
+}
+/// Whether this path names a Grok Build Swarm binary (symlink or versioned asset).
+fn exe_looks_like_swarm(exe: Option<&Path>) -> bool {
+    let Some(name) = exe
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    else {
+        return false;
+    };
+    let base = name
+        .trim_end_matches(".exe")
+        .trim_end_matches(".EXE");
+    base == "grok-swarm"
+        || base.starts_with("grok-swarm-")
+        || base.eq_ignore_ascii_case("grokswarm")
 }
 /// Core leader-binary resolution with the current-exe path injected, for testability.
 fn resolve_binary_impl(
     grok_home: &Path,
     current_exe: Option<std::path::PathBuf>,
 ) -> Result<std::path::PathBuf, ConnectionError> {
-    let managed_bin = grok_home.join("bin").join(managed_grok_bin_name());
+    let managed_name = managed_bin_name_for_exe(current_exe.as_deref());
+    let managed_bin = grok_home.join("bin").join(managed_name);
     if let Some(ref exe) = current_exe
         && path_is_under(exe, grok_home)
         && managed_bin.exists()
@@ -1376,6 +1462,8 @@ fn resolve_binary_impl(
     if managed_bin.exists() {
         return Ok(managed_bin);
     }
+    // Swarm client with only stock managed bin present: still refuse to spawn
+    // stock as the swarm leader when we know we wanted swarm (no current_exe).
     Err(ConnectionError::SpawnFailed(
         "could not determine binary path for leader spawn".into(),
     ))
@@ -1730,7 +1818,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(
-                should_evict_conn(&conn),
+                should_evict_conn(&conn, None),
                 expect_evict,
                 "leader version {binary_version:?} vs client {CLIENT_LEADER_VERSION}"
             );
@@ -1759,7 +1847,7 @@ mod tests {
             conn.registration().leader_binary_version.as_deref(),
             Some(CLIENT_LEADER_VERSION)
         );
-        assert!(!should_evict_conn(&conn));
+        assert!(!should_evict_conn(&conn, None));
         fake.cancel();
     }
     #[tokio::test]
@@ -2166,6 +2254,49 @@ mod tests {
         std::fs::write(&managed, "managed").unwrap();
         let result = resolve_binary_impl(temp.path(), None).unwrap();
         assert_eq!(result, managed);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn resolve_binary_swarm_managed_install_uses_grok_swarm_symlink() {
+        // Regression: grok-swarm under ~/.grok used to spawn stock ~/.grok/bin/grok
+        // as the leader (no Heavy pipeline).
+        let temp = TempDir::new().unwrap();
+        let bin_dir = temp.path().join("bin");
+        let downloads = temp.path().join("downloads");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&downloads).unwrap();
+        let stock_target = downloads.join("grok-0.2.106-macos-aarch64");
+        let swarm_target = downloads.join("grok-swarm-0.2.106-macos-aarch64");
+        std::fs::write(&stock_target, "stock").unwrap();
+        std::fs::write(&swarm_target, "swarm").unwrap();
+        let stock_link = bin_dir.join("grok");
+        let swarm_link = bin_dir.join("grok-swarm");
+        std::os::unix::fs::symlink(&stock_target, &stock_link).unwrap();
+        std::os::unix::fs::symlink(&swarm_target, &swarm_link).unwrap();
+        // current_exe is the versioned download target (like real macOS installs).
+        let result = resolve_binary_impl(temp.path(), Some(swarm_target)).unwrap();
+        assert_eq!(
+            result, swarm_link,
+            "swarm client must spawn managed grok-swarm, not stock grok"
+        );
+        // Stock client still uses stock symlink.
+        let result = resolve_binary_impl(temp.path(), Some(stock_target)).unwrap();
+        assert_eq!(result, stock_link);
+    }
+    #[test]
+    fn exe_looks_like_swarm_detects_versioned_assets() {
+        assert!(exe_looks_like_swarm(Some(Path::new(
+            "/Users/x/.grok/downloads/grok-swarm-0.2.106-macos-aarch64"
+        ))));
+        assert!(exe_looks_like_swarm(Some(Path::new(
+            "/Users/x/.grok/bin/grok-swarm"
+        ))));
+        assert!(!exe_looks_like_swarm(Some(Path::new(
+            "/Users/x/.grok/bin/grok"
+        ))));
+        assert!(!exe_looks_like_swarm(Some(Path::new(
+            "/Users/x/.grok/downloads/grok-0.2.106-macos-aarch64"
+        ))));
     }
     #[test]
     fn pid_check_identifies_dead_leader() {
