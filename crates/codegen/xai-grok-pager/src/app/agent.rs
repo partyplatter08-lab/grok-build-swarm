@@ -695,8 +695,11 @@ pub struct AgentSession {
     /// shell side via `ReconnectState::user_selected_model`; the pager still
     /// applies live remote switches and updates this field to match.
     pub user_model_preference: Option<acp::ModelId>,
-    /// `/model X [effort]` issued before the session was ready, applied on SessionCreated.
-    pub deferred_model_switch: Option<(acp::ModelId, Option<ReasoningEffort>)>,
+    /// `/model X [effort]` or `/effort` issued before the session was ready,
+    /// applied on SessionCreated. Third field is the effort menu option id
+    /// (e.g. `"heavy"` / `"swarm"`) so multi-agent modes survive session
+    /// materialization — they all wire as `xhigh` and must not collapse to it.
+    pub deferred_model_switch: Option<(acp::ModelId, Option<ReasoningEffort>, Option<String>)>,
     /// Central bg task state, keyed by task_id.
     pub bg_tasks: BTreeMap<String, BgTaskState>,
     /// Correlation map: tool_call_id → task_id.

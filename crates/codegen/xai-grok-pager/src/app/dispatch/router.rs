@@ -843,19 +843,31 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             };
             let Some(session_id) = agent.session.session_id.clone() else {
-                agent.session.deferred_model_switch = Some((model_id, effort));
-                // Stash option id for display / deferred apply without a live session.
-                if let Some(oid) = effort_option_id {
-                    agent.session.models.reasoning_effort_option_id = Some(oid);
+                // Carry option id in the deferred tuple — session create replaces
+                // ModelState from the server (wire xhigh) and would otherwise wipe
+                // a multi-agent selection so the footer reverts on first send.
+                agent.session.deferred_model_switch =
+                    Some((model_id, effort, effort_option_id.clone()));
+                if let Some(ref oid) = effort_option_id {
+                    agent.session.models.reasoning_effort_option_id = Some(oid.clone());
                 }
                 return vec![];
             };
             agent.session.model_switch_pending = true;
-            // Do NOT optimistically overwrite reasoning_effort / option_id here.
-            // handle_switch_model_complete compares prev vs resolved to decide
-            // whether to show the switch toast + multi-agent banners. Pre-writing
-            // made Heavy/Swarm (wire-xhigh) look "unchanged" so confirmation never
-            // appeared when config default was already xhigh.
+            // Stick multi-agent option id immediately so the footer cannot
+            // revert to wire "xhigh" while the RPC is in flight (or if a
+            // ModelChanged echo races the complete handler). Toast/banner still
+            // fire from handle_switch_model_complete using the option id on the
+            // complete event (not "unchanged" wire effort alone).
+            if let Some(ref oid) = effort_option_id {
+                use xai_grok_shell::sampling::types::OrchestrationMode;
+                if OrchestrationMode::from_option_id(oid).is_multi_agent() {
+                    agent.session.models.reasoning_effort_option_id = Some(oid.clone());
+                    if let Some(eff) = effort {
+                        agent.session.models.reasoning_effort = Some(eff);
+                    }
+                }
+            }
             vec![Effect::SwitchModel {
                 agent_id: id,
                 session_id,

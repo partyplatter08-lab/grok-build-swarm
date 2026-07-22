@@ -128,7 +128,7 @@ fn stashed_model_switch_prefers_explicit_stash() {
     let models = models_with_current(true);
     let other = acp::ModelId::new(Arc::from("other-model"));
     let out = take_deferred_model_switch(
-        Some((other.clone(), Some(ReasoningEffort::Low))),
+        Some((other.clone(), Some(ReasoningEffort::Low), None)),
         &models,
         Some("high"),
     );
@@ -147,7 +147,7 @@ fn stashed_model_switch_prefers_explicit_stash() {
 fn stashed_model_re_resolves_remap_when_effort_missing() {
     let models = models_with_current(true);
     let current = models.current.clone().unwrap();
-    let out = take_deferred_model_switch(Some((current.clone(), None)), &models, Some("deep"));
+    let out = take_deferred_model_switch(Some((current.clone(), None, None)), &models, Some("deep"));
     assert_eq!(
         out,
         DeferredSwitchOutcome {
@@ -165,7 +165,7 @@ fn stashed_model_re_resolves_remap_when_effort_missing() {
 fn stashed_model_keeps_model_when_token_unresolvable() {
     let models = models_with_current(true);
     let current = models.current.clone().unwrap();
-    let out = take_deferred_model_switch(Some((current.clone(), None)), &models, Some("bogus"));
+    let out = take_deferred_model_switch(Some((current.clone(), None, None)), &models, Some("bogus"));
     assert_eq!(out.switch, Some((current, None, None)));
     match out.effort_error {
         Some(EffortTokenError::UnknownToken { token, .. }) => assert_eq!(token, "bogus"),
@@ -180,7 +180,7 @@ fn stashed_model_keeps_model_when_unsupported() {
     let mut models = models_with_current(true);
     let (plain, plain_info) = model_with_support("plain-model", false);
     models.available.insert(plain.clone(), plain_info);
-    let out = take_deferred_model_switch(Some((plain.clone(), None)), &models, Some("high"));
+    let out = take_deferred_model_switch(Some((plain.clone(), None, None)), &models, Some("high"));
     assert_eq!(
         out,
         DeferredSwitchOutcome {
@@ -244,5 +244,32 @@ fn multi_agent_token_skips_when_already_active() {
             switch: None,
             effort_error: None,
         }
+    );
+}
+
+#[test]
+fn stashed_multi_agent_option_id_survives_without_cli_token() {
+    // User picked Heavy via /effort before the session existed. On send,
+    // session create must re-apply option id "heavy" — not collapse to wire xhigh.
+    let models = models_with_current(true);
+    let current = models.current.clone().unwrap();
+    let out = take_deferred_model_switch(
+        Some((
+            current.clone(),
+            Some(ReasoningEffort::Xhigh),
+            Some("heavy".into()),
+        )),
+        &models,
+        None,
+    );
+    assert_eq!(out.effort_error, None);
+    assert_eq!(
+        out.switch,
+        Some((
+            current,
+            Some(ReasoningEffort::Xhigh),
+            Some("heavy".into()),
+        )),
+        "stashed multi-agent option id must survive deferred apply"
     );
 }

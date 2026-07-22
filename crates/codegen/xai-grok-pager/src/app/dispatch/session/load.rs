@@ -892,9 +892,22 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
         if let Some(placeholder_id) = agent.loading_placeholder_id.take() {
             agent.scrollback.remove_entry(placeholder_id);
         }
+        let sticky_option = agent
+            .session
+            .deferred_model_switch
+            .as_ref()
+            .and_then(|(_, _, oid)| oid.clone())
+            .or_else(|| agent.session.models.reasoning_effort_option_id.clone())
+            .filter(|id| {
+                use xai_grok_shell::sampling::types::OrchestrationMode;
+                OrchestrationMode::from_option_id(id).is_multi_agent()
+            });
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
+            if let Some(oid) = sticky_option {
+                agent.session.models.reasoning_effort_option_id = Some(oid);
+            }
         }
         let deferred = crate::app::dispatch::session::lifecycle::apply_deferred_model_switch(
             agent,

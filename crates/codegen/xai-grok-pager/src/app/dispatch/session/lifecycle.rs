@@ -38,21 +38,27 @@ pub(crate) struct DeferredSwitchOutcome {
 /// Resolve the stashed `-m` switch and/or `cli_effort_token` against the session
 /// catalog via [`ModelState::resolve_effort_for_model`] (same gate-first policy
 /// as `/effort` and headless).
+///
+/// Stashed third field is the effort menu option id (e.g. `"heavy"`). It must
+/// survive session create — multi-agent modes all wire as `xhigh` and must not
+/// collapse to the bare wire token when the server catalog is applied.
 pub(crate) fn take_deferred_model_switch(
-    stashed: Option<(acp::ModelId, Option<ReasoningEffort>)>,
+    stashed: Option<(acp::ModelId, Option<ReasoningEffort>, Option<String>)>,
     models: &ModelState,
     cli_effort_token: Option<&str>,
 ) -> DeferredSwitchOutcome {
-    if let Some((model_id, mut effort)) = stashed {
-        let mut option_id = None;
+    if let Some((model_id, mut effort, mut option_id)) = stashed {
         let effort_error = match cli_effort_token {
             Some(token) if effort.is_none() => {
                 match models.resolve_effort_for_model(&model_id, token) {
                     Ok(resolved) => {
                         effort = Some(resolved);
-                        option_id = models
+                        // Prefer CLI-resolved option id; keep any pre-stashed
+                        // multi-agent id if CLI token is a bare wire level.
+                        let resolved_oid = models
                             .resolve_effort_token_with_id_for(&model_id, token)
                             .map(|(_, id)| id);
+                        option_id = resolved_oid.or(option_id);
                         None
                     }
                     Err(err) => Some(err),
@@ -60,12 +66,27 @@ pub(crate) fn take_deferred_model_switch(
             }
             Some(token) => {
                 // Model already stashed with an effort; still capture multi-agent
-                // option id so protocol inject + footer labels work.
-                option_id = models
+                // option id so protocol inject + footer labels work. Prefer
+                // stashed multi-agent id over a wire-only CLI token.
+                let from_cli = models
                     .resolve_effort_token_with_id_for(&model_id, token)
                     .map(|(_, id)| id);
+                option_id = match (option_id, from_cli) {
+                    (Some(stashed_oid), Some(cli_oid)) => {
+                        use xai_grok_shell::sampling::types::OrchestrationMode;
+                        if OrchestrationMode::from_option_id(&stashed_oid).is_multi_agent() {
+                            Some(stashed_oid)
+                        } else {
+                            Some(cli_oid)
+                        }
+                    }
+                    (Some(oid), None) => Some(oid),
+                    (None, cli) => cli,
+                };
                 None
             }
+            // No CLI token: keep the stashed option id (Heavy/Swarm from /effort
+            // before the session existed).
             _ => None,
         };
         return DeferredSwitchOutcome {
@@ -848,9 +869,24 @@ pub(in crate::app::dispatch) fn handle_session_created(
             )));
         }
         agent.bind_session_id(session_id);
+        // Capture multi-agent option before catalog replace — ModelState::from
+        // invents option_id from wire effort ("xhigh") and would wipe Heavy/Swarm.
+        let sticky_option = agent
+            .session
+            .deferred_model_switch
+            .as_ref()
+            .and_then(|(_, _, oid)| oid.clone())
+            .or_else(|| agent.session.models.reasoning_effort_option_id.clone())
+            .filter(|id| {
+                use xai_grok_shell::sampling::types::OrchestrationMode;
+                OrchestrationMode::from_option_id(id).is_multi_agent()
+            });
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
+            if let Some(oid) = sticky_option {
+                agent.session.models.reasoning_effort_option_id = Some(oid);
+            }
         }
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
         let deferred_mode = agent.deferred_session_mode.take();
@@ -939,9 +975,22 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         agent.bind_session_id(session_id);
         agent.session.cwd = session_cwd.clone();
         agent.session.is_worktree = true;
+        let sticky_option = agent
+            .session
+            .deferred_model_switch
+            .as_ref()
+            .and_then(|(_, _, oid)| oid.clone())
+            .or_else(|| agent.session.models.reasoning_effort_option_id.clone())
+            .filter(|id| {
+                use xai_grok_shell::sampling::types::OrchestrationMode;
+                OrchestrationMode::from_option_id(id).is_multi_agent()
+            });
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
+            if let Some(oid) = sticky_option {
+                agent.session.models.reasoning_effort_option_id = Some(oid);
+            }
         }
         agent.prompt.file_search.retarget(&session_cwd);
         agent.scrollback.push_block(RenderBlock::system(format!(
@@ -1105,12 +1154,15 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 let unchanged = prev_model.as_ref() == Some(&model_id)
                     && prev_effort == resolved_effort
                     && prev_option == resolved_option;
-                // Multi-agent modes share wire xhigh — always confirm when the
-                // option id (or mode) actually changed, even if wire effort did not.
+                // Multi-agent modes share wire xhigh. Router may optimistically
+                // pre-set the option id so prev==resolved even on first select —
+                // still announce when the complete carries a multi-agent option.
                 let mode = agent.session.models.orchestration_mode();
-                let should_announce = !unchanged
-                    || (mode.is_multi_agent()
-                        && prev_option.as_deref() != resolved_option.as_deref());
+                let incoming_multi = effort_option_id.as_deref().is_some_and(|id| {
+                    use xai_grok_shell::sampling::types::OrchestrationMode;
+                    OrchestrationMode::from_option_id(id).is_multi_agent()
+                });
+                let should_announce = !unchanged || incoming_multi;
                 if should_announce {
                     let effort_label = agent
                         .session
@@ -1194,7 +1246,7 @@ pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
         {
             agent.session.models.set_current(model_id.clone(), effort);
             if effort.is_some() {
-                agent.session.deferred_model_switch = Some((model_id, effort));
+                agent.session.deferred_model_switch = Some((model_id, effort, None));
             }
         }
         effects

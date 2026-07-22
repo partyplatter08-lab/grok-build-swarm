@@ -800,7 +800,7 @@ fn switch_model_deferred_when_no_session_id() {
     assert!(effects.is_empty());
     assert_eq!(
         app.agents[&id].session.deferred_model_switch,
-        Some((model_id, None))
+        Some((model_id, None, None))
     );
     assert!(!app.agents[&id].session.model_switch_pending);
 }
@@ -815,7 +815,7 @@ fn deferred_model_switch_applied_on_session_created() {
         .get_mut(&id)
         .unwrap()
         .session
-        .deferred_model_switch = Some((model_id.clone(), None));
+        .deferred_model_switch = Some((model_id.clone(), None, None));
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionCreated {
             agent_id: id,
@@ -855,7 +855,7 @@ fn deferred_model_switch_applied_on_worktree_session_created() {
         .get_mut(&id)
         .unwrap()
         .session
-        .deferred_model_switch = Some((model_id.clone(), None));
+        .deferred_model_switch = Some((model_id.clone(), None, None));
     let session_id: acp::SessionId = "wt-session".into();
     let effects = dispatch(
         Action::TaskComplete(TaskResult::WorktreeSessionCreated {

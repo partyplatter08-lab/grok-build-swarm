@@ -1432,8 +1432,9 @@ impl AppView {
     ) -> Option<(
         acp::ModelId,
         Option<xai_grok_shell::sampling::types::ReasoningEffort>,
+        Option<String>,
     )> {
-        Some((self.cli_model_override.clone()?, None))
+        Some((self.cli_model_override.clone()?, None, None))
     }
     /// Voice capture is armed: the in-prompt dictation overlay can show and
     /// Ctrl+Space can start capture.

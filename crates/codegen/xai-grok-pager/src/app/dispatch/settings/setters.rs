@@ -1682,7 +1682,7 @@ pub(in crate::app::dispatch) fn set_default_model(
         // No session id yet — stash for
         // `EventLoop::on_session_created` to apply once the session
         // id materialises. Mirrors `Action::SwitchModel` line 586.
-        agent.session.deferred_model_switch = Some((new_id, None));
+        agent.session.deferred_model_switch = Some((new_id, None, None));
     }
     effects
 }
