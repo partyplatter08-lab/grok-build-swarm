@@ -195,8 +195,14 @@ pub enum SessionCommand {
         /// `compaction.threshold_percent` (which is `Cell<u8>` so it can
         /// update without `&mut self`).
         auto_compact_threshold_percent: u8,
-        /// Multi-agent effort option id to persist, or `None` to clear.
-        orchestration_mode: Option<String>,
+        /// Multi-agent effort option id update for this model switch:
+        /// - `None` — leave session mode unchanged (internal model refresh)
+        /// - `Some(None)` — explicitly clear multi-agent mode (user picked normal effort)
+        /// - `Some(Some(id))` — set to `heavy` / `swarm` / `swarm-heavy`
+        ///
+        /// Never treat a missing meta key as clear — that demoted Heavy/Swarm
+        /// to single-agent over time.
+        orchestration_mode: Option<Option<String>>,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
     },
     /// Zero-turn harness rebuild: build a brand-new `Agent` from the

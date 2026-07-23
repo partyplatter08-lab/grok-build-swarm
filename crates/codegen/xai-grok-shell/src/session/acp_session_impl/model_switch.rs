@@ -9,9 +9,11 @@ impl SessionActor {
         apply_prompt_override: bool,
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
-        // Multi-agent option id to persist (`heavy` / `swarm` / `swarm-heavy`),
-        // or `None` to clear. Always written (resume needs the last value).
-        orchestration_mode: Option<String>,
+        // Multi-agent option id update:
+        // - `None` leave actor mode unchanged
+        // - `Some(None)` clear multi-agent mode
+        // - `Some(Some(id))` set `heavy` / `swarm` / `swarm-heavy`
+        orchestration_mode: Option<Option<String>>,
     ) -> Result<acp::ModelId, acp::Error> {
         let model_id = acp::ModelId::new(sampling_config.model.clone());
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
@@ -107,7 +109,24 @@ impl SessionActor {
                 "handle_set_session_model: skipping prompt rewrite (just rebuilt harness)"
             );
         }
+        // Code-enforced multi-agent mode: update only when the client
+        // explicitly passed an orchestrationMode meta key.
+        if let Some(mode) = orchestration_mode {
+            *self.orchestration_mode.lock() = mode.clone();
+            tracing::info!(
+                session_id = %self.session_info.id.0,
+                ?mode,
+                "handle_set_session_model: code-enforced orchestration mode updated"
+            );
+        }
+        // After any system-prompt rewrite, re-stamp protocol if multi-agent
+        // is still active so compaction/model-switch cannot strand the mode
+        // as "text only" while the actor field says multi-agent.
+        self.restamp_orchestration_protocol_if_needed().await;
+
         let agent_name = self.agent.borrow().definition().name.clone();
+        // Persist the effective mode (current actor state), not only the delta.
+        let effective_mode = self.orchestration_mode.lock().clone();
         let _ = self
             .notifications
             .persistence_tx
@@ -115,9 +134,58 @@ impl SessionActor {
                 model_id: model_id.clone(),
                 agent_name: Some(agent_name),
                 reasoning_effort: Some(sampling_config.reasoning_effort),
-                orchestration_mode: Some(orchestration_mode),
+                orchestration_mode: Some(effective_mode),
             });
         Ok(model_id)
+    }
+
+    /// If multi-agent mode is code-active, ensure the system head still carries
+    /// the matching protocol appendix (best-effort; pipeline does not depend on it).
+    pub(super) async fn restamp_orchestration_protocol_if_needed(&self) {
+        use xai_grok_sampling_types::OrchestrationMode;
+        let mode = self
+            .orchestration_mode
+            .lock()
+            .clone()
+            .map(|id| OrchestrationMode::from_option_id(&id))
+            .unwrap_or(OrchestrationMode::Normal);
+        let Some(protocol) = mode.protocol_prompt() else {
+            return;
+        };
+        let mut conversation = self.chat_state_handle.get_conversation().await;
+        let Some(ConversationItem::System(sys)) = conversation.first_mut() else {
+            return;
+        };
+        let markers = [
+            "\n## ◈ HEAVY MODE",
+            "\n## ⬡ SWARM MODE",
+            "\n## ⬢ SWARM HEAVY MODE",
+        ];
+        let content = sys.content.as_ref();
+        let already = markers.iter().any(|m| content.contains(m.trim_start()));
+        if already {
+            return;
+        }
+        let mut base = content;
+        for m in markers {
+            if let Some(idx) = base.find(m) {
+                base = &base[..idx];
+                break;
+            }
+        }
+        if base.trim().is_empty() {
+            return;
+        }
+        let new_prompt = format!("{}\n{protocol}", base.trim_end());
+        if !replace_or_insert_system_head(&mut conversation, &new_prompt) {
+            return;
+        }
+        self.chat_state_handle.replace_conversation(conversation);
+        tracing::info!(
+            session_id = %self.session_info.id.0,
+            mode = %mode,
+            "restamp_orchestration_protocol: re-appended multi-agent protocol"
+        );
     }
     /// Handle [`SessionCommand::RebuildAgentForDefinition`].
     ///

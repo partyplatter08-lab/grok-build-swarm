@@ -767,6 +767,11 @@ pub(crate) struct SessionActor {
     /// `Arc`-shared with the notification bridge so `PlanModeEntered` /
     /// `PlanModeExited` tool notifications can transition state directly.
     pub(crate) plan_mode: Arc<parking_lot::Mutex<crate::session::plan_mode::PlanModeTracker>>,
+    /// Code-enforced multi-agent orchestration mode option id
+    /// (`heavy` / `swarm` / `swarm-heavy`). Source of truth for whether turns
+    /// run the heavy pipeline — **not** system-prompt text. Cleared only when
+    /// the user explicitly selects a non multi-agent effort option.
+    pub(crate) orchestration_mode: parking_lot::Mutex<Option<String>>,
     /// Whether goal mode (`/goal`) is enabled for this session (feature flag).
     pub(crate) goal_enabled: bool,
     /// `goal_enabled` && `update_goal` in toolset; refreshed with command availability.

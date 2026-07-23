@@ -281,11 +281,10 @@ impl SessionActor {
                 .handle_direct_bash_command(prompt_id, bash_command, &prompt_blocks)
                 .await;
         }
-        // Multi-agent effort modes: captain model + code-enforced workers
-        // (Heavy/SH: council+RIT · Swarm: map→implement→verify).
-        // Skip when plan mode is on — plan mode needs the normal tool/reminder
-        // path (enter/exit_plan_mode). Swarm pipelines were short-circuiting
-        // the turn and making plan mode appear broken.
+        // Multi-agent effort modes: code-enforced pipeline every user turn
+        // while SessionActor.orchestration_mode is Heavy/Swarm/SwarmHeavy.
+        // NOT gated on system-prompt text (that demoted to single-agent over time).
+        // Skip only for plan mode — plan needs the normal tool/reminder path.
         if !origin.is_synthetic() && self.should_run_heavy_pipeline().await {
             let plan_blocks_swarm = {
                 use crate::session::plan_mode::{PlanModeState, PromptMode};
@@ -295,7 +294,12 @@ impl SessionActor {
                     PlanModeState::Pending | PlanModeState::Active | PlanModeState::ExitPending
                 ) || matches!(prompt_mode, PromptMode::Plan)
             };
-            if !plan_blocks_swarm {
+            if plan_blocks_swarm {
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    "orchestration: multi-agent mode active but plan mode owns this turn"
+                );
+            } else {
                 let user_text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
                     if let acp::ContentBlock::Text(t) = b {
                         if !acc.is_empty() {
@@ -306,6 +310,10 @@ impl SessionActor {
                     acc
                 });
                 if !user_text.trim().is_empty() {
+                    tracing::info!(
+                        session_id = %self.session_info.id.0,
+                        "orchestration: running code-enforced multi-agent pipeline"
+                    );
                     return self.run_heavy_pipeline(prompt_id, user_text.trim()).await;
                 }
             }

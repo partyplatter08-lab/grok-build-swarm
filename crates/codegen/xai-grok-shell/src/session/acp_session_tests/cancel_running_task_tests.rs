@@ -215,6 +215,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     )),
                 )),
                 goal_enabled: false,
+                orchestration_mode: parking_lot::Mutex::new(None),
                 goal_harness_enabled: std::sync::atomic::AtomicBool::new(false),
                 goal_harness_availability_reconciled: std::sync::atomic::AtomicBool::new(false),
                 goal_tracker: Arc::new(parking_lot::Mutex::new(
@@ -670,6 +671,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     )),
                 )),
                 goal_enabled: false,
+                orchestration_mode: parking_lot::Mutex::new(None),
                 goal_harness_enabled: std::sync::atomic::AtomicBool::new(false),
                 goal_harness_availability_reconciled: std::sync::atomic::AtomicBool::new(false),
                 goal_tracker: Arc::new(parking_lot::Mutex::new(
@@ -944,6 +946,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     ),
                 ),
                 goal_enabled: false,
+                orchestration_mode: parking_lot::Mutex::new(None),
                 goal_harness_enabled: std::sync::atomic::AtomicBool::new(false),
                 goal_harness_availability_reconciled: std::sync::atomic::AtomicBool::new(
                     false,
@@ -2176,6 +2179,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     ),
                 ),
                 goal_enabled: false,
+                orchestration_mode: parking_lot::Mutex::new(None),
                 goal_harness_enabled: std::sync::atomic::AtomicBool::new(false),
                 goal_harness_availability_reconciled: std::sync::atomic::AtomicBool::new(
                     false,

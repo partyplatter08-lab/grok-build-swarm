@@ -24,13 +24,21 @@ pub(crate) async fn apply(
     );
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
     let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
-    let orchestration_mode = args
-        .meta
-        .as_ref()
-        .and_then(|m| m.get(ORCHESTRATION_MODE_META_KEY))
-        .and_then(|v| v.as_str())
-        .map(OrchestrationMode::from_option_id)
-        .unwrap_or(OrchestrationMode::Normal);
+    // Only change multi-agent mode when the client explicitly stamps
+    // `orchestrationMode` in meta. Missing key = leave mode alone (model
+    // refresh / reconnect must NOT demote Heavy → single-agent).
+    // Present string → set/clear based on parse; present null → clear.
+    let orchestration_mode_update: Option<Option<String>> = args.meta.as_ref().and_then(|m| {
+        let v = m.get(ORCHESTRATION_MODE_META_KEY)?;
+        if v.is_null() {
+            return Some(None);
+        }
+        let mode = v
+            .as_str()
+            .map(OrchestrationMode::from_option_id)
+            .unwrap_or(OrchestrationMode::Normal);
+        Some(mode.option_id().map(|s| s.to_string()))
+    });
     let acp::SetSessionModelRequest {
         session_id,
         model_id,
@@ -40,6 +48,18 @@ pub(crate) async fn apply(
         .session_handle_waiting_for_load(&session_id)
         .await
         .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
+    // Effective mode for protocol inject: explicit update, else keep handle.
+    let orchestration_mode = match &orchestration_mode_update {
+        Some(opt) => opt
+            .as_deref()
+            .map(OrchestrationMode::from_option_id)
+            .unwrap_or(OrchestrationMode::Normal),
+        None => handle
+            .orchestration_mode
+            .as_deref()
+            .map(OrchestrationMode::from_option_id)
+            .unwrap_or(OrchestrationMode::Normal),
+    };
     let model = agent.resolve_model_id(&model_id)?;
     let use_concise = model.info().use_concise;
     let session_default = handle
@@ -199,14 +219,14 @@ pub(crate) async fn apply(
         )
     };
     let (tx, rx) = oneshot::channel();
-    let orchestration_option_id = orchestration_mode.option_id().map(|s| s.to_string());
     let _ = handle.cmd_tx.send(SessionCommand::SetSessionModel {
         sampling_config: model_sampling,
         use_concise,
         apply_prompt_override,
         skip_prompt_rewrite: did_rebuild || model_unchanged,
         auto_compact_threshold_percent: new_threshold,
-        orchestration_mode: orchestration_option_id.clone(),
+        // None = leave actor mode alone; Some(...) = set/clear.
+        orchestration_mode: orchestration_mode_update.clone(),
         responds_to: tx,
     });
     let updated_model = rx
@@ -215,13 +235,16 @@ pub(crate) async fn apply(
     if let Some(handle) = agent.sessions.borrow_mut().get_mut(&session_id) {
         handle.model_id = model_id.clone();
         handle.reasoning_effort = applied_effort;
-        handle.orchestration_mode = orchestration_option_id;
+        // Only touch handle mode when the client explicitly updated it.
+        if let Some(mode) = orchestration_mode_update.clone() {
+            handle.orchestration_mode = mode;
+        }
         handle.agent_name =
             agent_name_after_model_switch(did_rebuild, &required_agent_type, &handle.agent_name);
-        // Inject multi-agent protocol into the live system prompt when a
-        // Heavy / Swarm / Swarm Heavy effort option was selected so the
-        // model actually orchestrates on the next turn.
-        if let Some(protocol) = orchestration_mode.protocol_prompt() {
+        // Keep protocol text in sync with the code-enforced mode. Pipeline
+        // gating uses SessionActor.orchestration_mode — this is extra signal
+        // for any residual single-agent path, not the source of truth.
+        if orchestration_mode_update.is_some() {
             let marker_alts = [
                 "\n## ◈ HEAVY MODE",
                 "\n## ⬡ SWARM MODE",
@@ -230,7 +253,6 @@ pub(crate) async fn apply(
             let current = crate::session::persistence::find_session_dir_by_id(session_id.0.as_ref())
                 .and_then(|d| std::fs::read_to_string(d.join("system_prompt.txt")).ok())
                 .unwrap_or_else(|| {
-                    // Fall back to the handle's known session dir via Info.
                     let dir = crate::session::persistence::session_dir(&handle.info);
                     std::fs::read_to_string(dir.join("system_prompt.txt")).unwrap_or_default()
                 });
@@ -242,16 +264,20 @@ pub(crate) async fn apply(
                 }
             }
             let new_prompt = if base.trim().is_empty() {
-                // Keep a minimal head so we never wipe the real system prompt
-                // if the file was missing; leave protocol as a sticky appendix
-                // that ReplaceSystemPrompt will install only when we have a base.
-                tracing::warn!(
-                    session_id = %session_id.0,
-                    "set_session_model: system_prompt.txt missing; skipping protocol inject"
-                );
+                if orchestration_mode.is_multi_agent() {
+                    tracing::warn!(
+                        session_id = %session_id.0,
+                        "set_session_model: system_prompt.txt missing; skipping protocol inject"
+                    );
+                }
                 None
-            } else {
+            } else if let Some(protocol) = orchestration_mode.protocol_prompt() {
                 Some(format!("{}\n{protocol}", base.trim_end()))
+            } else if base.len() < current.len() {
+                // Explicit clear: strip protocol appendix only.
+                Some(base.trim_end().to_string())
+            } else {
+                None
             };
             if let Some(new_prompt) = new_prompt {
                 let _ = handle.cmd_tx.send(SessionCommand::ReplaceSystemPrompt {
@@ -260,7 +286,7 @@ pub(crate) async fn apply(
                 tracing::info!(
                     session_id = %session_id.0,
                     mode = %orchestration_mode,
-                    "set_session_model: injected multi-agent orchestration protocol into system prompt"
+                    "set_session_model: synced multi-agent protocol with code-enforced mode"
                 );
             }
         }

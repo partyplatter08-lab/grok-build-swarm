@@ -230,6 +230,7 @@ async fn create_test_actor_with_memory(
             )),
         )),
         goal_enabled: false,
+        orchestration_mode: parking_lot::Mutex::new(None),
         goal_harness_enabled: std::sync::atomic::AtomicBool::new(false),
         goal_harness_availability_reconciled: std::sync::atomic::AtomicBool::new(false),
         goal_tracker: Arc::new(parking_lot::Mutex::new(

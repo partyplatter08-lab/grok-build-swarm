@@ -798,6 +798,8 @@ async fn apply_headless_model_and_effort(
         use xai_grok_shell::sampling::types::{
             ORCHESTRATION_MODE_META_KEY, OrchestrationMode,
         };
+        // Always stamp orchestrationMode when the user picks an effort token
+        // so multi-agent modes set and normal efforts explicitly clear.
         let mode = OrchestrationMode::from_option_id(token);
         if mode.is_multi_agent() {
             m.insert(
@@ -813,7 +815,19 @@ async fn apply_headless_model_and_effort(
                     ORCHESTRATION_MODE_META_KEY.to_string(),
                     serde_json::Value::String(oid),
                 );
+            } else {
+                // Explicit clear — missing key would leave prior Heavy/Swarm on.
+                m.insert(
+                    ORCHESTRATION_MODE_META_KEY.to_string(),
+                    serde_json::Value::String(oid),
+                );
             }
+        } else {
+            // Token is a plain wire effort (high/xhigh/…) — clear multi-agent.
+            m.insert(
+                ORCHESTRATION_MODE_META_KEY.to_string(),
+                serde_json::Value::String(token.to_string()),
+            );
         }
     }
     let meta = if m.is_empty() { None } else { Some(m) };

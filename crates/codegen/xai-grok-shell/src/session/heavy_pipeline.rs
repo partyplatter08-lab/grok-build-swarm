@@ -180,17 +180,62 @@ pub(crate) fn detect_mode_from_system(system: &str) -> OrchestrationMode {
 impl SessionActor {
     /// Any multi-agent effort mode that uses a code-enforced pipeline.
     pub(super) async fn should_run_heavy_pipeline(&self) -> bool {
-        matches!(
-            self.current_orchestration_mode().await,
-            OrchestrationMode::Heavy | OrchestrationMode::Swarm | OrchestrationMode::SwarmHeavy
-        )
+        self.current_orchestration_mode().await.is_multi_agent()
     }
 
+    /// Authoritative multi-agent mode for this session.
+    ///
+    /// Order of truth:
+    /// 1. `SessionActor.orchestration_mode` — set by effort menu / resume (code path)
+    /// 2. Legacy heal: system-prompt protocol markers from older builds
+    ///
+    /// Never derive mode from system text alone when the actor field is set —
+    /// prompt rewrites / compaction used to demote Heavy to single-agent.
     async fn current_orchestration_mode(&self) -> OrchestrationMode {
+        if let Some(id) = self.orchestration_mode.lock().clone() {
+            let mode = OrchestrationMode::from_option_id(&id);
+            if mode.is_multi_agent() {
+                return mode;
+            }
+            // Explicit clear stored as Some("high") etc. → Normal
+            if id.trim().is_empty() {
+                return OrchestrationMode::Normal;
+            }
+            // Unknown id still Normal
+            return mode;
+        }
+        // Heal legacy sessions that only have protocol text in the system head.
         let conv = self.chat_state_handle.get_conversation().await;
         for item in &conv {
             if let crate::sampling::ConversationItem::System(sys) = item {
-                return detect_mode_from_system(&sys.content);
+                let mode = detect_mode_from_system(&sys.content);
+                if mode.is_multi_agent() {
+                    if let Some(oid) = mode.option_id() {
+                        *self.orchestration_mode.lock() = Some(oid.to_string());
+                        tracing::info!(
+                            session_id = %self.session_info.id.0,
+                            mode = %mode,
+                            "orchestration: healed multi-agent mode from system protocol into session state"
+                        );
+                        // Persist so resume does not re-scrape forever.
+                        let model_name = self
+                            .chat_state_handle
+                            .get_sampling_config()
+                            .await
+                            .map(|c| c.model)
+                            .unwrap_or_default();
+                        let _ = self.notifications.persistence_tx.send(
+                            crate::session::persistence::PersistenceMsg::CurrentModel {
+                                model_id: acp::ModelId::new(model_name),
+                                agent_name: Some(self.agent.borrow().definition().name.clone()),
+                                reasoning_effort: None, // leave effort unchanged
+                                orchestration_mode: Some(Some(oid.to_string())),
+                            },
+                        );
+                    }
+                    return mode;
+                }
+                break;
             }
         }
         OrchestrationMode::Normal
