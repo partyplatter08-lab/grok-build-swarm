@@ -317,10 +317,13 @@ impl SessionActor {
 
         self.emit_agent_text(
             "── **Synthesis** ──\n\
-             Pulling the board together into one answer for you…",
+             This is the Heavy part that earns the name: I now **judge the board** \
+             as the captain — not dump worker logs. One model pass over council + RIT \
+             to decide what actually matters…",
         )
         .await;
-        self.emit_agent_text(&synthesize(user_text, &prior)).await;
+        let final_answer = self.synthesize_with_model(user_text, &prior).await;
+        self.emit_agent_text(&final_answer).await;
         tracing::info!(
             session_id = %session_id,
             stages = prior.len(),
@@ -337,6 +340,93 @@ impl SessionActor {
             None,
         )
         .await;
+    }
+
+    /// Real captain judgment: one tool-free model call over the pipeline board.
+    /// This is what makes Heavy more than “spawn 4 agents and paste their logs.”
+    async fn synthesize_with_model(
+        &self,
+        user_text: &str,
+        prior: &[(String, String)],
+    ) -> String {
+        let fallback = synthesize_board_dump(user_text, prior);
+        let sampling_client = match self.prepare_chat_completion(false).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "heavy_pipeline: synthesize prepare_chat_completion failed");
+                return fallback;
+            }
+        };
+        let model = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|c| c.model)
+            .unwrap_or_default();
+        if model.is_empty() {
+            return fallback;
+        }
+
+        let mut board = String::new();
+        for (name, body) in prior {
+            board.push_str("### ");
+            board.push_str(name);
+            board.push_str("\n\n");
+            // Cap each section so the synthesize call stays focused.
+            board.push_str(&body.chars().take(6_000).collect::<String>());
+            board.push_str("\n\n");
+        }
+
+        use crate::sampling::{ConversationItem, ConversationRequest};
+        let request = ConversationRequest::from_items(vec![
+            ConversationItem::system(
+                "You are the HEAVY CAPTAIN synthesizing a multi-agent board.\n\
+                 You received outputs from a parallel council (Analyst, Skeptic, Explorer, Builder) \
+                 and a Research → Implement → Test pipeline.\n\n\
+                 Your job is NOT to restate every worker verbatim. Your job is to:\n\
+                 1. Answer the user's request directly and completely\n\
+                 2. Prefer conclusions supported by multiple lenses or hard evidence\n\
+                 3. Call out real disagreements and residual risks briefly\n\
+                 4. Be concrete (paths, commands, decisions) when the board has them\n\
+                 5. Write as the final user-facing answer — clear, decisive, high signal\n\n\
+                 Do not invent work that the pipeline did not do. Do not refuse because you \
+                 are 'only synthesizing' — you ARE the answer channel.",
+            ),
+            ConversationItem::user(format!(
+                "## User request\n\n{user}\n\n## Pipeline board\n\n{board}\n\n\
+                 Write the final # ◈ HEAVY RESULT answer for the user now.",
+                user = user_text.trim(),
+                board = board,
+            )),
+        ])
+        .with_model(model)
+        .with_max_output_tokens(4_096);
+
+        match sampling_client.conversation_collect(request).await {
+            Ok(response) => {
+                let text = response.assistant_text();
+                if text.trim().is_empty() {
+                    tracing::warn!("heavy_pipeline: synthesize returned empty text");
+                    fallback
+                } else {
+                    // Prefer captain prose; keep a short board index at the end.
+                    let mut out = text.trim().to_string();
+                    if !out.contains("HEAVY RESULT") && !out.starts_with('#') {
+                        out = format!("# ◈ HEAVY RESULT\n\n{out}");
+                    }
+                    out.push_str(
+                        "\n\n---\n\
+                         *Heavy board: parallel council + Research → Implement → Test. \
+                         Open worker cards for full traces.*",
+                    );
+                    out
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "heavy_pipeline: synthesize model call failed");
+                fallback
+            }
+        }
     }
 }
 
@@ -567,13 +657,14 @@ async fn spawn_and_wait(
         .map_err(|_| "subagent result channel dropped".to_string())
 }
 
-fn synthesize(user_text: &str, prior: &[(String, String)]) -> String {
-    let mut out = String::from("# ◈ HEAVY RESULT\n\n");
+/// Fallback when the captain model call fails — board dump, not a real judgment.
+fn synthesize_board_dump(user_text: &str, prior: &[(String, String)]) -> String {
+    let mut out = String::from("# ◈ HEAVY RESULT (board dump — captain synthesis unavailable)\n\n");
     out.push_str("**Request:** ");
     out.push_str(user_text.trim());
     out.push_str(
-        "\n\nRan a **code-enforced** Heavy pipeline: parallel council, then \
-         Research → Implement → Test. Full worker traces live on the cards above.\n\n",
+        "\n\nRan parallel council + Research → Implement → Test. \
+         Full worker traces live on the cards above.\n\n",
     );
     for (name, body) in prior {
         out.push_str("## ");
