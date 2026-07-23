@@ -11,13 +11,17 @@
 //! ```
 //!
 //! Council + RIT are **real** subagents via `SubagentEvent::Spawn`.
-//! Worker streams live in subagent cards (open a card for full thinking);
-//! the parent feed gets phase banners + synthesis only — not per-token
-//! `[Council/…]` dumps (those interleave into unreadable noise).
+//!
+//! Parent chat is the **captain channel** (Grok Heavy style): it narrates the
+//! plan, heartbeats while workers run, and posts clean per-member theses as
+//! they finish. Full worker thinking stays on subagent cards — not per-token
+//! dumps into the parent feed (those interleave into unreadable noise).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_client_protocol as acp;
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::OrchestrationMode;
 use xai_grok_tools::implementations::grok_build::task::types::{
@@ -27,6 +31,9 @@ use xai_tool_types::SubagentCapabilityMode as CapMode;
 
 use super::SessionActor;
 use crate::session::commands::{self, PromptTurnResult};
+
+/// How often the captain posts a "still working" heartbeat while council runs.
+const COUNCIL_HEARTBEAT: Duration = Duration::from_secs(5);
 
 // ── Council (parallel) ──────────────────────────────────────────────────────
 
@@ -164,13 +171,21 @@ impl SessionActor {
             "heavy_pipeline: council + RIT start"
         );
 
+        let goal_line = first_line(user_text, 160);
         self.emit_agent_text(&format!(
-            "{}\n\n**Code-enforced pipeline**\n\
-             0. **Parallel council** (Analyst · Skeptic · Explorer · Builder)\n\
-             1–3. **Research → Implement → Test** (sequential)\n\
-             4. Synthesis\n\n\
-             Worker thinking streams into this chat with labels; open cards for full detail.",
-            mode_banner(mode)
+            "{}\n\n\
+             I'll run this the way **Grok Heavy** does: same problem, many lenses, \
+             then I synthesize. You stay in this chat — I'll narrate live.\n\n\
+             **Your ask:** {goal}\n\n\
+             **Plan**\n\
+             0. **Parallel council** — Analyst · Skeptic · Explorer · Builder (all at once)\n\
+             1. **Research** — deepen with tools (read-only)\n\
+             2. **Implement** — make the change\n\
+             3. **Test** — verify\n\
+             4. **Synthesis** — my final answer from the full board\n\n\
+             Open a worker card for full thinking; I'll post theses and progress here.",
+            mode_banner(mode),
+            goal = goal_line,
         ))
         .await;
 
@@ -179,14 +194,27 @@ impl SessionActor {
         // ── Phase 0: parallel council ───────────────────────────────────
         self.emit_agent_text(
             "── **Phase 0 · Parallel council** ──\n\
-             Spawning Analyst · Skeptic · Explorer · Builder **in parallel**…",
+             Launching four lenses on the **same** problem:\n\
+             - ◈ **Analyst** — frame goals, constraints, success\n\
+             - ◈ **Skeptic** — attack weak assumptions\n\
+             - ◈ **Explorer** — alternatives & context\n\
+             - ◈ **Builder** — concrete plan\n\n\
+             Spawning all four **now**…",
         )
         .await;
 
-        let council_results =
-            run_council_parallel(&event_tx, &session_id, prompt_id, &id_prefix, user_text).await;
+        let council_results = run_council_parallel(
+            self,
+            &event_tx,
+            &session_id,
+            prompt_id,
+            &id_prefix,
+            user_text,
+        )
+        .await;
 
         let mut council_digest = String::from("## Council theses (parallel)\n\n");
+        let mut theses: Vec<(String, String)> = Vec::new();
         for (desc, result) in &council_results {
             let body = match result {
                 Ok(r) if r.success => r.output.to_string(),
@@ -196,9 +224,9 @@ impl SessionActor {
                 ),
                 Err(e) => format!("[error] {e}"),
             };
-            let preview: String = body.chars().take(2000).collect();
-            self.emit_agent_text(&format!("✓ Council member done · {desc}\n\n{preview}"))
-                .await;
+            let role = short_role(desc);
+            let thesis = extract_thesis(&body);
+            theses.push((role.clone(), thesis.clone()));
             council_digest.push_str("### ");
             council_digest.push_str(desc);
             council_digest.push_str("\n\n");
@@ -207,12 +235,39 @@ impl SessionActor {
         }
         prior.push(("council".into(), council_digest));
 
+        // Captain cross-check after the board is full.
+        let mut board = String::from(
+            "── **Council board (all in)** ──\n\
+             Here's how the four lenses landed:\n\n",
+        );
+        for (role, thesis) in &theses {
+            board.push_str(&format!("- **{role}:** {thesis}\n"));
+        }
+        board.push_str(
+            "\nI'll carry this into Research → Implement → Test. \
+             If they disagreed, the next stages must resolve it with evidence.",
+        );
+        self.emit_agent_text(&board).await;
+
         // ── Phases 1–3: RIT sequential ──────────────────────────────────
         for (idx, stage) in STAGES.iter().enumerate() {
             let n = idx + 1;
+            let phase_talk = match stage.id_suffix {
+                "research" => {
+                    "Going deeper with tools before we touch code. Research is read-only."
+                }
+                "implement" => {
+                    "Council + research are the brief. Time to make the change."
+                }
+                "test" => "Verifying the work — checks, tests, residual risks.",
+                _ => "Pipeline stage running.",
+            };
             self.emit_agent_text(&format!(
-                "── **Phase {n}/3 · RIT** · {} ──\nSpawning `{}`…",
-                stage.description, stage.subagent_type
+                "── **Phase {n}/3 · {}** ──\n\
+                 {phase_talk}\n\
+                 Spawning `{stype}`… I'll report when this stage lands.",
+                stage.description,
+                stype = stage.subagent_type,
             ))
             .await;
 
@@ -240,9 +295,9 @@ impl SessionActor {
                             result.error.unwrap_or_else(|| "unknown".into())
                         )
                     };
-                    let preview: String = out.chars().take(1500).collect();
+                    let summary = extract_stage_summary(&out);
                     self.emit_agent_text(&format!(
-                        "✓ **Phase {n} complete** · {}\n\n{preview}",
+                        "✓ **Phase {n} complete** · {}\n\n{summary}",
                         stage.description
                     ))
                     .await;
@@ -250,7 +305,8 @@ impl SessionActor {
                 }
                 Err(e) => {
                     self.emit_agent_text(&format!(
-                        "✗ **Phase {n} failed** · {}: {e}",
+                        "✗ **Phase {n} failed** · {}: {e}\n\
+                         I'll note the gap and keep going so we still get a synthesis.",
                         stage.description
                     ))
                     .await;
@@ -259,6 +315,11 @@ impl SessionActor {
             }
         }
 
+        self.emit_agent_text(
+            "── **Synthesis** ──\n\
+             Pulling the board together into one answer for you…",
+        )
+        .await;
         self.emit_agent_text(&synthesize(user_text, &prior)).await;
         tracing::info!(
             session_id = %session_id,
@@ -294,19 +355,25 @@ fn mode_banner(mode: OrchestrationMode) -> String {
     }
 }
 
-/// Fire all council spawns, then await every result (true parallelism).
+/// Fire all council spawns, then collect results as they finish (true parallelism).
+///
+/// Narrates live: immediate post when a member lands, plus heartbeats while
+/// others are still working — so the parent chat never goes silent mid-council.
 async fn run_council_parallel(
+    actor: &SessionActor,
     event_tx: &tokio::sync::mpsc::UnboundedSender<SubagentEvent>,
     parent_session_id: &str,
     prompt_id: &str,
     id_prefix: &str,
     user_text: &str,
 ) -> Vec<(String, Result<SubagentResult, String>)> {
-    enum Pending {
-        Failed(String),
-        Waiting(oneshot::Receiver<SubagentResult>),
-    }
-    let mut pending: Vec<(String, Pending)> = Vec::with_capacity(COUNCIL.len());
+    let mut futs: FuturesUnordered<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = (String, Result<SubagentResult, String>)> + Send>,
+        >,
+    > = FuturesUnordered::new();
+    let mut early: Vec<(String, Result<SubagentResult, String>)> = Vec::new();
+    let mut outstanding: Vec<String> = Vec::new();
 
     for member in COUNCIL {
         let (result_tx, result_rx) = oneshot::channel();
@@ -317,7 +384,8 @@ async fn run_council_parallel(
              - **Argument** (bullets)\n\
              - **Evidence** (paths / facts)\n\
              - **Risks**\n\
-             - **What to check next**\n",
+             - **What to check next**\n\
+             Keep Thesis crisp — the captain will quote it in the live board.\n",
             lens = member.lens,
             user = user_text
         );
@@ -342,28 +410,94 @@ async fn run_council_parallel(
             result_tx,
         };
         let desc = member.description.to_string();
+        let role = short_role(&desc);
         if event_tx
             .send(SubagentEvent::Spawn(Box::new(request)))
             .is_err()
         {
-            pending.push((
+            early.push((
                 desc,
-                Pending::Failed("subagent coordinator channel closed".into()),
+                Err("subagent coordinator channel closed".into()),
             ));
             continue;
         }
-        pending.push((desc, Pending::Waiting(result_rx)));
+        outstanding.push(role.clone());
+        futs.push(Box::pin(async move {
+            let res = result_rx
+                .await
+                .map_err(|_| "subagent result channel dropped".to_string());
+            (desc, res)
+        }));
+        actor
+            .emit_agent_text(&format!("● **{role}** is live (card open for full stream)."))
+            .await;
     }
 
-    let mut out = Vec::with_capacity(pending.len());
-    for (desc, p) in pending {
-        match p {
-            Pending::Failed(e) => out.push((desc, Err(e))),
-            Pending::Waiting(rx) => {
-                let res = rx
-                    .await
-                    .map_err(|_| "subagent result channel dropped".to_string());
+    if !outstanding.is_empty() {
+        actor
+            .emit_agent_text(&format!(
+                "Council is running in parallel · **{}** outstanding. \
+                 I'll post each thesis the moment it lands.",
+                outstanding.join(" · ")
+            ))
+            .await;
+    }
+
+    let mut out = early;
+    let mut heartbeat = tokio::time::interval(COUNCIL_HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate first tick so we don't double-announce.
+    heartbeat.tick().await;
+
+    while !futs.is_empty() {
+        tokio::select! {
+            biased;
+            Some((desc, res)) = futs.next() => {
+                let role = short_role(&desc);
+                outstanding.retain(|r| r != &role);
+                match &res {
+                    Ok(r) if r.success => {
+                        let thesis = extract_thesis(&r.output);
+                        actor
+                            .emit_agent_text(&format!(
+                                "✓ **{role}** in\n\
+                                 **Thesis:** {thesis}"
+                            ))
+                            .await;
+                    }
+                    Ok(r) => {
+                        let err = r.error.clone().unwrap_or_else(|| "unknown".into());
+                        actor
+                            .emit_agent_text(&format!("✗ **{role}** failed · {err}"))
+                            .await;
+                    }
+                    Err(e) => {
+                        actor
+                            .emit_agent_text(&format!("✗ **{role}** error · {e}"))
+                            .await;
+                    }
+                }
+                if !outstanding.is_empty() {
+                    actor
+                        .emit_agent_text(&format!(
+                            "Still waiting on: **{}**",
+                            outstanding.join(" · ")
+                        ))
+                        .await;
+                }
                 out.push((desc, res));
+            }
+            _ = heartbeat.tick(), if !futs.is_empty() => {
+                if outstanding.is_empty() {
+                    continue;
+                }
+                actor
+                    .emit_agent_text(&format!(
+                        "⏳ Council still working · **{}** outstanding… \
+                         (full reasoning is on their cards)",
+                        outstanding.join(" · ")
+                    ))
+                    .await;
             }
         }
     }
@@ -434,12 +568,12 @@ async fn spawn_and_wait(
 }
 
 fn synthesize(user_text: &str, prior: &[(String, String)]) -> String {
-    let mut out = String::from("# ◈ HEAVY PIPELINE RESULT\n\n");
+    let mut out = String::from("# ◈ HEAVY RESULT\n\n");
     out.push_str("**Request:** ");
     out.push_str(user_text.trim());
     out.push_str(
-        "\n\n**Code-enforced** parallel council + Research → Implement → Test.\n\
-         Thinking from each worker was also streamed into this chat with labels.\n\n",
+        "\n\nRan a **code-enforced** Heavy pipeline: parallel council, then \
+         Research → Implement → Test. Full worker traces live on the cards above.\n\n",
     );
     for (name, body) in prior {
         out.push_str("## ");
@@ -449,4 +583,135 @@ fn synthesize(user_text: &str, prior: &[(String, String)]) -> String {
         out.push_str("\n\n");
     }
     out
+}
+
+fn short_role(description: &str) -> String {
+    if let Some(rest) = description.strip_prefix('[')
+        && let Some(close) = rest.find(']')
+    {
+        let tag = rest[..close].trim();
+        // "[Council/Analyst]" → "Analyst"
+        if let Some((_, role)) = tag.split_once('/') {
+            return role.trim().to_string();
+        }
+        if !tag.is_empty() {
+            return tag.to_string();
+        }
+    }
+    description.chars().take(24).collect()
+}
+
+fn first_line(text: &str, max_chars: usize) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(text.trim());
+    let mut s: String = line.chars().take(max_chars).collect();
+    if line.chars().count() > max_chars {
+        s.push('…');
+    }
+    s
+}
+
+/// Pull a short thesis from council / stage output for live narration.
+fn extract_thesis(body: &str) -> String {
+    let lower = body.to_ascii_lowercase();
+    // Prefer an explicit Thesis section.
+    for marker in ["**thesis**", "thesis:", "## thesis", "### thesis"] {
+        if let Some(idx) = lower.find(marker) {
+            let after = body[idx + marker.len()..].trim_start();
+            let chunk = after
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .unwrap_or(after);
+            return first_line(chunk, 280);
+        }
+    }
+    // Fall back to first non-heading, non-empty line.
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            !l.is_empty()
+                && !l.starts_with('#')
+                && !l.starts_with("---")
+                && !l.eq_ignore_ascii_case("thesis")
+        })
+        .unwrap_or(body.trim());
+    first_line(line, 280)
+}
+
+fn extract_stage_summary(body: &str) -> String {
+    let lower = body.to_ascii_lowercase();
+    for marker in ["**summary**", "summary:", "## summary", "### summary", "- **summary"] {
+        if let Some(idx) = lower.find(marker) {
+            let after = body[idx..].trim();
+            // Take a few lines after the marker for a readable handoff.
+            let mut lines = Vec::new();
+            for (i, line) in after.lines().enumerate() {
+                if i > 0 && (line.starts_with("## ") || line.starts_with("**Evidence")) {
+                    break;
+                }
+                let t = line.trim();
+                if !t.is_empty() {
+                    lines.push(t);
+                }
+                if lines.len() >= 8 {
+                    break;
+                }
+            }
+            if !lines.is_empty() {
+                return lines.join("\n");
+            }
+        }
+    }
+    // Compact fallback — not a 1500-char dump.
+    let mut out = String::new();
+    for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if out.len() + line.len() > 700 {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+        if out.lines().count() >= 10 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        first_line(body, 400)
+    } else {
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_role_from_council_tag() {
+        assert_eq!(
+            short_role("[Council/Analyst] structure the problem"),
+            "Analyst"
+        );
+        assert_eq!(short_role("[Council/Skeptic] attack"), "Skeptic");
+    }
+
+    #[test]
+    fn extract_thesis_prefers_labeled_section() {
+        let body = "## Stuff\n\n**Thesis**\nShip the fix behind a flag.\n\n**Argument**\n- a\n";
+        assert_eq!(extract_thesis(body), "Ship the fix behind a flag.");
+    }
+
+    #[test]
+    fn extract_thesis_falls_back_to_first_line() {
+        assert_eq!(
+            extract_thesis("Just a plain answer without headers."),
+            "Just a plain answer without headers."
+        );
+    }
 }
