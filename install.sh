@@ -107,41 +107,27 @@ _draw_bar() {
   fi
 }
 
-# Download with a live progress bar that always works.
-# curl's own --progress-bar is silent when stderr is not a TTY and can look
-# "stuck" for minutes on a ~150MB binary. We run curl in the background and
-# poll the output file size ourselves so every environment sees updates.
-download_with_progress() {
-  local url="$1" out="$2" label="${3:-downloading}"
-  local size=0 cur=0 last=0 pct=0 speed=0
-  local pid rc tick=0 stalled=0
-  local curl_log err_line
+# Sum sizes of chunk files matching a glob prefix (best-effort).
+_sum_chunk_bytes() {
+  local prefix="$1" total=0 sz f
+  # nullglob-safe loop
+  for f in "${prefix}".*; do
+    [[ -f "$f" ]] || continue
+    sz="$(wc -c <"$f" 2>/dev/null | tr -d ' ')" || sz=0
+    [[ "$sz" =~ ^[0-9]+$ ]] || sz=0
+    total=$(( total + sz ))
+  done
+  printf '%s' "$total"
+}
 
-  # Probe final Content-Length (GitHub returns 0 on the redirect hop first).
-  # Keep it short so a hung HEAD never blocks the real download.
-  size="$(
-    curl -fsSIL --connect-timeout 10 --max-time 20 \
-      -A 'grok-swarm-install' "$url" 2>/dev/null \
-      | tr -d '\r' \
-      | awk 'tolower($1)=="content-length:" && $2+0 > 0 { n=$2 } END { if (n) print n; else print 0 }'
-  )" || size=0
-  # sanitize
-  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+# Single-connection download with live progress (fallback path).
+_download_single() {
+  local url="$1" out="$2" label="$3" size="${4:-0}"
+  local cur=0 last=0 pct=0 speed=0 pid rc tick=0 stalled=0
+  local curl_log
 
-  if [[ "$size" -gt 0 ]]; then
-    info "${label} ($(human_bytes "$size"))…"
-  else
-    info "${label}…"
-  fi
-  info "this is ~150MB — first bytes can take a few seconds on slow links"
-
-  # Truncate / create destination so size polling starts at 0
   : >"$out"
   curl_log="$(mktemp "${TMPDIR:-/tmp}/grok-swarm-curl.XXXXXX")"
-
-  # Silent curl in background; we own the UI. --fail-with-body not portable;
-  # use -f and capture stderr to the log for error messages.
-  # connect-timeout avoids hanging forever on a bad network.
   curl -fL --connect-timeout 30 --retry 3 --retry-delay 2 \
     -A 'grok-swarm-install' \
     -o "$out" "$url" \
@@ -152,23 +138,118 @@ download_with_progress() {
   tick=0
   stalled=0
   while kill -0 "$pid" 2>/dev/null; do
-    if [[ -f "$out" ]]; then
-      cur="$(wc -c <"$out" 2>/dev/null | tr -d ' ')" || cur=0
-    else
-      cur=0
-    fi
+    cur=0
+    [[ -f "$out" ]] && cur="$(wc -c <"$out" 2>/dev/null | tr -d ' ')" || true
     [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
-
-    speed=$(( cur > last ? cur - last : 0 ))
-    # poll every ~0.5s → speed is bytes per tick; scale to /s
-    speed=$(( speed * 2 ))
-
+    speed=$(( cur > last ? (cur - last) * 2 : 0 ))
     if [[ "$size" -gt 0 ]]; then
       pct=$(( cur * 100 / size ))
       _draw_bar "$pct" "$(human_bytes "$cur")" "$(human_bytes "$size")" "$label" "$(human_bytes "$speed")"
     else
-      # Unknown total: indeterminate-style counter
       _draw_bar "$(( tick % 100 ))" "$(human_bytes "$cur")" "" "$label" "$(human_bytes "$speed")"
+    fi
+    if [[ "$cur" -eq "$last" ]]; then
+      stalled=$((stalled + 1))
+    else
+      stalled=0
+    fi
+    if [[ "$stalled" -eq 120 ]]; then
+      printf '\n' >&2
+      warn "no new data for ~60s — still waiting (curl may be retrying)…"
+    fi
+    if [[ "$stalled" -ge 360 ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      printf '\n' >&2
+      rm -f "$curl_log"
+      return 1
+    fi
+    last=$cur
+    tick=$((tick + 1))
+    sleep 0.5
+  done
+
+  rc=0
+  wait "$pid" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    printf '\n' >&2
+    tr -d '\r' <"$curl_log" 2>/dev/null | tail -5 >&2 || true
+    rm -f "$curl_log"
+    return 1
+  fi
+  rm -f "$curl_log"
+  cur=0
+  [[ -f "$out" ]] && cur="$(wc -c <"$out" 2>/dev/null | tr -d ' ')" || true
+  if [[ "$size" -gt 0 ]]; then
+    _draw_bar 100 "$(human_bytes "$cur")" "$(human_bytes "$size")" "$label" ""
+  else
+    _draw_bar 100 "$(human_bytes "$cur")" "" "$label" ""
+  fi
+  printf '\n' >&2
+  return 0
+}
+
+# Parallel byte-range download (same idea as stock grok install.sh).
+# GitHub/Azure release CDN supports Range requests — 8 connections often
+# multiplies throughput on links that cap a single TCP stream.
+_download_parallel() {
+  local url="$1" out="$2" label="$3" size="$4"
+  local n=8
+  local chunk_size start end i pid pids=() rc=0
+  local cur=0 last=0 pct=0 speed=0 tick=0 stalled=0
+  local tmpdir curl_log
+
+  # Need a real size and Accept-Ranges support worth trying
+  if [[ "$size" -lt 16777216 ]]; then
+    return 1
+  fi
+
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/grok-swarm-dl.XXXXXX")" || return 1
+  curl_log="${tmpdir}/curl.log"
+  : >"$curl_log"
+  chunk_size=$(( (size + n - 1) / n ))
+
+  info "using ${n} parallel connections…"
+
+  for i in $(seq 0 $((n - 1))); do
+    start=$(( i * chunk_size ))
+    end=$(( start + chunk_size - 1 ))
+    if [[ "$end" -ge "$size" ]]; then
+      end=$(( size - 1 ))
+    fi
+    # shellcheck disable=SC2086
+    (
+      curl -fL --connect-timeout 30 --retry 3 --retry-delay 1 \
+        -A 'grok-swarm-install' \
+        -r "${start}-${end}" \
+        -o "${tmpdir}/chunk.$(printf '%03d' "$i")" \
+        "$url" >>"$curl_log" 2>&1
+    ) &
+    pids+=($!)
+  done
+
+  last=0
+  tick=0
+  stalled=0
+  # Wait until all chunk workers exit
+  while true; do
+    local alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        alive=1
+        break
+      fi
+    done
+    cur="$(_sum_chunk_bytes "${tmpdir}/chunk")"
+    [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+    # Cap display at size (concat may briefly over-read nothing)
+    if [[ "$cur" -gt "$size" ]]; then cur=$size; fi
+    speed=$(( cur > last ? (cur - last) * 2 : 0 ))
+    pct=$(( cur * 100 / size ))
+    _draw_bar "$pct" "$(human_bytes "$cur")" "$(human_bytes "$size")" "$label" "$(human_bytes "$speed")"
+
+    if [[ "$alive" -eq 0 ]]; then
+      break
     fi
 
     if [[ "$cur" -eq "$last" ]]; then
@@ -176,57 +257,103 @@ download_with_progress() {
     else
       stalled=0
     fi
-    # ~60s with no growth → warn (still waiting on curl/retry)
     if [[ "$stalled" -eq 120 ]]; then
       printf '\n' >&2
-      warn "download has not received new data for ~60s — still waiting (curl may be retrying)…"
+      warn "no new data for ~60s — still waiting…"
     fi
     if [[ "$stalled" -ge 360 ]]; then
-      # ~3 minutes stalled
-      kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
+      for pid in "${pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+      done
+      for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+      done
       printf '\n' >&2
-      err_line="$(tr -d '\r' <"$curl_log" 2>/dev/null | tail -3 | tr '\n' ' ')"
-      rm -f "$curl_log"
-      err "download stalled with no data for ~3 minutes.
-${err_line}
-URL: $url
-Check your network, VPN, or GitHub access and re-run the installer."
+      rm -rf "$tmpdir"
+      return 1
     fi
-
     last=$cur
     tick=$((tick + 1))
     sleep 0.5
   done
 
-  # set -e would abort on a failed wait; capture rc explicitly
-  rc=0
-  wait "$pid" || rc=$?
+  # Collect exit codes
+  for pid in "${pids[@]}"; do
+    wait "$pid" || rc=1
+  done
+
+  if [[ "$rc" -ne 0 ]]; then
+    printf '\n' >&2
+    tail -8 "$curl_log" 2>/dev/null >&2 || true
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  # Concatenate chunks in order
+  : >"$out"
+  for i in $(seq 0 $((n - 1))); do
+    local chunk="${tmpdir}/chunk.$(printf '%03d' "$i")"
+    if [[ ! -f "$chunk" ]]; then
+      printf '\n' >&2
+      rm -rf "$tmpdir"
+      return 1
+    fi
+    cat "$chunk" >>"$out"
+  done
+
+  cur="$(wc -c <"$out" 2>/dev/null | tr -d ' ')" || cur=0
+  if [[ "$cur" -ne "$size" ]]; then
+    printf '\n' >&2
+    warn "parallel download size mismatch (got ${cur}, expected ${size}) — will retry single stream"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  _draw_bar 100 "$(human_bytes "$cur")" "$(human_bytes "$size")" "$label" ""
+  printf '\n' >&2
+  rm -rf "$tmpdir"
+  return 0
+}
+
+# Download with a live progress bar that always works.
+# Prefer multi-connection range requests (much faster on many links); fall
+# back to a single stream. We never rely on curl's own progress meter.
+download_with_progress() {
+  local url="$1" out="$2" label="${3:-downloading}"
+  local size=0 cur=0
+
+  # Probe final Content-Length (GitHub returns 0 on the redirect hop first).
+  size="$(
+    curl -fsSIL --connect-timeout 10 --max-time 20 \
+      -A 'grok-swarm-install' "$url" 2>/dev/null \
+      | tr -d '\r' \
+      | awk 'tolower($1)=="content-length:" && $2+0 > 0 { n=$2 } END { if (n) print n; else print 0 }'
+  )" || size=0
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
+  if [[ "$size" -gt 0 ]]; then
+    info "${label} ($(human_bytes "$size")) — large binary, parallel download when possible…"
+  else
+    info "${label}…"
+  fi
+
+  # Try parallel first when we know the size; fall back to single stream.
+  if [[ "$size" -gt 0 ]] && _download_parallel "$url" "$out" "$label" "$size"; then
+    :
+  elif _download_single "$url" "$out" "$label" "$size"; then
+    :
+  else
+    return 1
+  fi
+
   cur=0
   [[ -f "$out" ]] && cur="$(wc -c <"$out" 2>/dev/null | tr -d ' ')" || true
   [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
-
-  if [[ "$rc" -eq 0 ]]; then
-    if [[ "$size" -gt 0 ]]; then
-      _draw_bar 100 "$(human_bytes "$cur")" "$(human_bytes "$size")" "$label" ""
-    else
-      _draw_bar 100 "$(human_bytes "$cur")" "" "$label" ""
-    fi
-    printf '\n' >&2
-    rm -f "$curl_log"
-    # Sanity: empty file is never a valid binary
-    if [[ "$cur" -lt 1000000 ]]; then
-      err "download finished but file is only $(human_bytes "$cur") — expected ~150MB.
+  if [[ "$cur" -lt 1000000 ]]; then
+    err "download finished but file is only $(human_bytes "$cur") — expected ~150MB.
 URL: $url"
-    fi
-    return 0
   fi
-
-  printf '\n' >&2
-  err_line="$(tr -d '\r' <"$curl_log" 2>/dev/null | tail -5)"
-  rm -f "$curl_log"
-  printf '%s\n' "$err_line" >&2
-  return 1
+  return 0
 }
 
 # Copy a large file while showing a simple byte progress bar.
