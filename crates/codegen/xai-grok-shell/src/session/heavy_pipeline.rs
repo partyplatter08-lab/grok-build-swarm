@@ -11,8 +11,9 @@
 //! ```
 //!
 //! Council + RIT are **real** subagents via `SubagentEvent::Spawn`.
-//! Child thinking is mirrored into the parent feed by the pager (see
-//! `acp_handler` child route).
+//! Worker streams live in subagent cards (open a card for full thinking);
+//! the parent feed gets phase banners + synthesis only — not per-token
+//! `[Council/…]` dumps (those interleave into unreadable noise).
 
 use std::sync::Arc;
 
