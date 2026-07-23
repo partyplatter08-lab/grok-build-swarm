@@ -210,7 +210,8 @@ pub(crate) fn screen_mode_relaunch_resume_hint(session_id: &str, want_minimal: b
     } else {
         "--fullscreen"
     };
-    format!("{GROK_SCREEN_MODE_ENV}={mode} grok {flag} --resume {session_id}")
+    let bin = crate::product::flavor().bin_name();
+    format!("{GROK_SCREEN_MODE_ENV}={mode} {bin} {flag} --resume {session_id}")
 }
 
 /// Replace the current process with a relaunch into the requested screen mode.
