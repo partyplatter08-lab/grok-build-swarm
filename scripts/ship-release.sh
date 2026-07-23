@@ -222,7 +222,22 @@ gh release create "$TAG" \
 
 ok "released ${TAG} with ${ASSET_NAME}"
 info "latest: https://github.com/${REPO}/releases/tag/${TAG}"
+
+# Local ship only builds *this* platform. Kick CI so Linux/other arches get
+# assets too (same tag). Without this, `grok-swarm update` on Linux 404s.
+if gh workflow list -R "$REPO" 2>/dev/null | grep -q release; then
+  info "triggering CI multi-platform build for ${TAG}…"
+  if gh workflow run release.yml -R "$REPO" -f "tag=${TAG}" 2>/dev/null; then
+    ok "CI release workflow started — linux/macos assets will attach to ${TAG} when done"
+    info "watch: gh run list -R ${REPO} --workflow=release.yml --limit 3"
+  else
+    info "could not start CI workflow (permissions?). Upload other platforms manually."
+  fi
+fi
+
 info ""
 info "On any machine with grok-swarm installed:"
 info "  grok-swarm update"
 info "  grok-swarm --version   # expect ${NEW_VER}"
+info ""
+info "Note: this machine uploaded ${platform} only. Other platforms need CI (started above)."

@@ -816,15 +816,53 @@ async fn try_parallel_download(
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(DOWNLOAD_REQUEST_TIMEOUT)
+        .user_agent(format!(
+            "grok-swarm-updater/{}",
+            xai_grok_version::VERSION
+        ))
+        .redirect(reqwest::redirect::Policy::limited(10))
         .build()?;
 
-    let head = client.head(url).send().await?;
-    if !head.status().is_success() {
-        anyhow::bail!("HEAD failed: HTTP {}", head.status());
+    // Prefer GET with a Range probe when HEAD is missing Content-Length
+    // (GitHub release CDN often returns 0 on the first redirect hop for HEAD).
+    let mut size = client
+        .head(url)
+        .send()
+        .await
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.content_length())
+        .filter(|&n| n > 0)
+        .unwrap_or(0);
+    if size == 0 {
+        // GET first byte to learn Content-Range total, then abort body.
+        let probe = client
+            .get(url)
+            .header("Range", "bytes=0-0")
+            .send()
+            .await?;
+        if let Some(cr) = probe.headers().get(reqwest::header::CONTENT_RANGE)
+            && let Ok(s) = cr.to_str()
+        {
+            // e.g. "bytes 0-0/158888736"
+            if let Some(total) = s.rsplit('/').next()
+                && let Ok(n) = total.parse::<u64>()
+            {
+                size = n;
+            }
+        }
+        if size == 0 {
+            size = probe
+                .content_length()
+                .filter(|&n| n > 1)
+                .unwrap_or(0);
+        }
+        // Drop connection; body not needed.
+        drop(probe);
     }
-    let size = head
-        .content_length()
-        .ok_or_else(|| anyhow::anyhow!("response missing Content-Length"))?;
+    if size == 0 {
+        anyhow::bail!("response missing Content-Length");
+    }
     if size < PARALLEL_DOWNLOAD_MIN_BYTES {
         anyhow::bail!("file too small for parallel download ({} bytes)", size);
     }
@@ -842,7 +880,7 @@ async fn try_parallel_download(
         let pb = ProgressBar::new(size);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("  {bar:30.cyan/dim} {bytes}/{total_bytes} ({eta})")
+                .template("  {bar:40.cyan/dim} {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
                 .unwrap()
                 .progress_chars("━╸─"),
         );
@@ -954,6 +992,10 @@ pub async fn download_with_progress(url: &str, dest: &std::path::Path) -> Result
 
     let client = reqwest::Client::builder()
         .timeout(DOWNLOAD_REQUEST_TIMEOUT)
+        .user_agent(format!(
+            "grok-swarm-updater/{}",
+            xai_grok_version::VERSION
+        ))
         .build()?;
     let resp = client.get(url).send().await?;
 
@@ -961,13 +1003,14 @@ pub async fn download_with_progress(url: &str, dest: &std::path::Path) -> Result
         anyhow::bail!("Download failed: HTTP {}", resp.status());
     }
 
-    let total_size = resp.content_length();
+    // After redirects, Content-Length may be on the final response.
+    let total_size = resp.content_length().filter(|&n| n > 0);
 
     let pb = if let Some(size) = total_size {
         let pb = ProgressBar::new(size);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("  {bar:30.cyan/dim} {bytes}/{total_bytes} ({eta})")
+                .template("  {bar:40.cyan/dim} {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
                 .unwrap()
                 .progress_chars("━╸─"),
         );
@@ -976,7 +1019,7 @@ pub async fn download_with_progress(url: &str, dest: &std::path::Path) -> Result
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()
-                .template("  {spinner:.cyan} {bytes} downloaded")
+                .template("  {spinner:.cyan} {bytes} downloaded ({bytes_per_sec})")
                 .unwrap(),
         );
         pb.enable_steady_tick(Duration::from_millis(100));
@@ -2039,13 +2082,15 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
     let tag = format!("v{version}");
 
     eprintln!(
-        "  Downloading {prefix} v{version} ({platform}) from GitHub Releases..."
+        "  Downloading {prefix} v{version} ({platform}) from GitHub Releases…"
     );
+    eprintln!("  (~150MB — progress bar below; parallel connections when supported)");
 
-    // Try `gh` first, then public HTTPS (works without gh auth).
-    if let Err(e) = gh_release_download(&tag, &binary_name, &binary_path).await {
-        tracing::warn!(error = %e, "gh release download failed; trying HTTPS");
-        download_gh_release_https(&tag, &binary_name, &binary_path).await?;
+    // Prefer HTTPS with a real progress bar (parallel ranges when possible).
+    // `gh release download` only shows a spinner and is slower for large assets.
+    if let Err(e) = download_gh_release_https(&tag, &binary_name, &binary_path).await {
+        tracing::warn!(error = %e, "HTTPS download failed; trying gh CLI");
+        gh_release_download(&tag, &binary_name, &binary_path).await?;
     }
 
     // chmod +x
@@ -2117,6 +2162,10 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
 }
 
 /// Public HTTPS download of a release asset (no `gh` CLI required).
+///
+/// Uses [`download_with_progress`] so `grok-swarm update` shows a live bar
+/// (and parallel range requests when the CDN allows) instead of hanging silent
+/// on a ~150MB body buffer.
 async fn download_gh_release_https(
     tag: &str,
     asset_name: &str,
@@ -2126,25 +2175,43 @@ async fn download_gh_release_https(
         "https://github.com/{}/releases/download/{tag}/{asset_name}",
         crate::version::GH_RELEASE_REPO
     );
-    let client = reqwest::Client::builder()
-        .timeout(DOWNLOAD_REQUEST_TIMEOUT)
-        .user_agent(format!(
-            "grok-swarm-updater/{}",
-            xai_grok_version::VERSION
-        ))
-        .build()?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        anyhow::bail!("download {url} returned HTTP {}", resp.status());
+
+    // Fast existence check with a friendly 404 before starting the big transfer.
+    {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(format!(
+                "grok-swarm-updater/{}",
+                xai_grok_version::VERSION
+            ))
+            .build()?;
+        let probe = client
+            .head(&url)
+            .send()
+            .await
+            .with_context(|| format!("HEAD {url}"))?;
+        // Some CDNs reject HEAD; only treat a definitive 404 as missing.
+        if probe.status().as_u16() == 404 {
+            anyhow::bail!(
+                "download {url} returned HTTP 404 Not Found\n\
+                 \n\
+                 No prebuilt binary for this platform in release {tag}.\n\
+                 Available assets: https://github.com/{}/releases/tag/{tag}\n\
+                 \n\
+                 Workarounds:\n\
+                   • Build from source:  git clone https://github.com/{} \\\n\
+                       && cd grok-build-swarm && ./scripts/install-cli.sh\n\
+                   • Wait for CI multi-arch assets on this tag, then:  grok-swarm update\n",
+                crate::version::GH_RELEASE_REPO,
+                crate::version::GH_RELEASE_REPO,
+            );
+        }
     }
-    let bytes = resp.bytes().await?;
-    let tmp = tmp_download_path(dest);
-    tokio::fs::write(&tmp, &bytes).await?;
-    publish_downloaded_artifact(&tmp, dest).await?;
+
+    // Shared path: parallel multi-connection + indicatif progress bar.
+    download_with_progress(&url, dest)
+        .await
+        .with_context(|| format!("download {url}"))?;
     Ok(())
 }
 
