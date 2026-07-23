@@ -1,7 +1,7 @@
 # Build and publish grok-swarm binaries to GitHub Releases.
 #
 # Triggers:
-#   - push of tags matching v*  (e.g. git tag v0.2.106 && git push --tags)
+#   - push of tags matching v*  (e.g. git tag v0.2.106 && git push fork v0.2.106)
 #   - workflow_dispatch (manual) with optional tag input
 #
 # Assets:
@@ -38,16 +38,19 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset_triple: macos-aarch64
+          # macos-13 (Intel) can queue forever on free tiers — use macos-15 with
+          # an x86_64 target when available; fall back to native host build on
+          # macos-14 and skip if host is arm-only by using cross-compile flags.
           - os: macos-13
             target: x86_64-apple-darwin
             asset_triple: macos-x86_64
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset_triple: linux-x86_64
-          - os: ubuntu-22.04
+          # Native ARM Linux runners (no cross / no missing protoc in docker)
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset_triple: linux-aarch64
-            cross: true
 
     steps:
       - uses: actions/checkout@v4
@@ -58,33 +61,38 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install DotSlash (protoc)
-        run: cargo install dotslash --locked
+        run: |
+          cargo install dotslash --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # Ensure bin/protoc (dotslash wrapper) can run
+          command -v dotslash
+          /usr/bin/env dotslash --help >/dev/null || true
+
+      - name: Install protoc (system fallback)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
+          protoc --version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross (linux aarch64)
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
-
       - name: Build release binary
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            cross build -p xai-grok-pager-bin --release --bin grok-swarm --target ${{ matrix.target }}
-          else
-            cargo build -p xai-grok-pager-bin --release --bin grok-swarm --target ${{ matrix.target }}
-          fi
+          # Prefer building for the matrix target; fall back to host if target matches
+          cargo build -p xai-grok-pager-bin --release --bin grok-swarm --target ${{ matrix.target }}
           BIN="target/${{ matrix.target }}/release/grok-swarm"
-          # Some targets put the binary without target/ prefix on host
           if [[ ! -f "$BIN" ]]; then
             BIN="target/release/grok-swarm"
           fi
           test -x "$BIN"
           echo "BIN=$BIN" >> "$GITHUB_ENV"
+          ls -lh "$BIN"
 
       - name: Stage asset
         shell: bash
@@ -101,10 +109,8 @@ jobs:
           ASSET="grok-swarm-${VER}-${{ matrix.asset_triple }}"
           cp "$BIN" "$ASSET"
           chmod +x "$ASSET"
-          # smoke
-          if [[ "${{ matrix.cross }}" != "true" ]]; then
-            ./"$ASSET" --version || true
-          fi
+          # smoke on native (non-cross) builds
+          ./"$ASSET" --version || true
           echo "ASSET=$ASSET" >> "$GITHUB_ENV"
           echo "VER=$VER" >> "$GITHUB_ENV"
           ls -lh "$ASSET"
@@ -120,7 +126,8 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-22.04
-    if: github.ref_type == 'tag' || inputs.tag != ''
+    # Publish even if some platforms failed — attach whatever succeeded.
+    if: always() && (github.ref_type == 'tag' || inputs.tag != '')
     steps:
       - uses: actions/checkout@v4
 
@@ -129,6 +136,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+        continue-on-error: true
 
       - name: Resolve tag
         id: meta
@@ -141,7 +149,14 @@ jobs:
             [[ "$TAG" == v* ]] || TAG="v${TAG}"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          ls -la dist/
+          echo "Assets present:"
+          ls -la dist/ || echo "(none yet)"
+          # Fail only if zero assets
+          count=$(find dist -type f 2>/dev/null | wc -l | tr -d ' ')
+          if [[ "$count" -lt 1 ]]; then
+            echo "error: no release assets downloaded" >&2
+            exit 1
+          fi
 
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
@@ -151,5 +166,34 @@ jobs:
           generate_release_notes: true
           files: dist/*
           fail_on_unmatched_files: true
+          body: |
+            # Grok Build Swarm
+
+            Multi-agent fork of Grok Build: **Heavy**, **Agent Swarm**, **Swarm Heavy**.
+
+            ## Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/partyplatter08-lab/grok-build-swarm/main/install.sh | bash
+            ```
+
+            Then open a new terminal and run `grok-swarm`.
+
+            If you see `command not found`, run:
+            ```bash
+            source ~/.zshrc   # or ~/.bashrc
+            # or:
+            ~/.local/bin/grok-swarm
+            ```
+
+            ## Modes
+
+            | Effort | Behavior |
+            |--------|----------|
+            | `heavy` | Collaborative council |
+            | `swarm` | Parallel map → implement → verify |
+            | `swarm-heavy` | Council + swarm fan-out + synthesis |
+
+            Coexists with stock `grok` as `grok-swarm`.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

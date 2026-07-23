@@ -11,8 +11,13 @@ curl -fsSL https://raw.githubusercontent.com/partyplatter08-lab/grok-build-swarm
 ```
 
 That downloads the latest **GitHub Release** binary for your platform into
-`~/.grok/downloads/`, links `~/.grok/bin/grok-swarm` (and `~/.local/bin/grok-swarm`),
-and turns on **auto-update** (`[cli] installer = "gh-release"`, `auto_update = true`).
+`~/.grok/downloads/`, installs `~/.local/bin/grok-swarm` + `~/.grok/bin/grok-swarm`,
+**writes those dirs onto your shell PATH**, and turns on **auto-update**
+(`[cli] installer = "gh-release"`, `auto_update = true`).
+
+If you see `command not found: grok-swarm`, open a new terminal (or
+`source ~/.zshrc` / `source ~/.bashrc`), or run `~/.local/bin/grok-swarm` directly.
+See the main [README](README.md) troubleshooting section.
 
 Then launch a normal interactive session:
 

@@ -82,11 +82,46 @@ fi
 echo "→ installed: $DEST"
 "$DEST" --version || true
 
+# Put PREFIX + ~/.grok/bin on PATH for future shells
+user_shell="$(basename "${SHELL:-}")"
+config_file=""
+case "$user_shell" in
+  bash) config_file="$HOME/.bashrc" ;;
+  zsh)  config_file="$HOME/.zshrc" ;;
+  fish) config_file="$HOME/.config/fish/config.fish" ;;
+esac
+MARKER_OPEN='# >>> grok-swarm installer >>>'
+MARKER_CLOSE='# <<< grok-swarm installer <<<'
+if [[ -n "$config_file" ]]; then
+  mkdir -p "$(dirname "$config_file")"
+  if [[ "$user_shell" == "fish" ]]; then
+    new_block="${MARKER_OPEN}
+fish_add_path \$HOME/.local/bin
+fish_add_path \$HOME/.grok/bin
+${MARKER_CLOSE}"
+  else
+    new_block="${MARKER_OPEN}
+export PATH=\"\$HOME/.local/bin:\$HOME/.grok/bin:\$PATH\"
+${MARKER_CLOSE}"
+  fi
+  if grep -qs "grok-swarm installer" "$config_file" 2>/dev/null; then
+    tmp_rc="$config_file.tmp.$$"
+    awk '
+      /# >>> grok-swarm installer >>>/ { skip=1; next }
+      /# <<< grok-swarm installer <<</ { skip=0; next }
+      !skip { print }
+    ' "$config_file" >"$tmp_rc" && mv "$tmp_rc" "$config_file"
+  fi
+  printf '\n%s\n' "$new_block" >>"$config_file"
+  echo "→ added PATH to $config_file"
+fi
+export PATH="$PREFIX:${HOME}/.grok/bin:${PATH}"
+
 case ":$PATH:" in
   *":$PREFIX:"*) ;;
   *)
     echo
-    echo "Note: $PREFIX is not on your PATH. Add this to your shell rc:"
+    echo "Note: $PREFIX may not be active in this shell yet. Open a new terminal, or:"
     echo "  export PATH=\"$PREFIX:\$PATH\""
     ;;
 esac
