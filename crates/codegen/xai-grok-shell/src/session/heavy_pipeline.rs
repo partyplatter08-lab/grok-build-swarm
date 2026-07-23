@@ -32,14 +32,21 @@ use crate::session::commands::{self, PromptTurnResult};
 const BOARD_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Hard cap so a hung worker never floods the parent feed.
 const MAX_HEARTBEATS: u32 = 3;
-/// How often we sample child speech for live dialogue in the parent chat.
-/// Snappy enough that speech appears as it streams, not only at the end.
-const DIALOGUE_POLL: Duration = Duration::from_millis(180);
+/// How often we sample child speech + tool events for the parent chat.
+/// Fast enough that talk and edits feel live, not end-of-turn dumps.
+const DIALOGUE_POLL: Duration = Duration::from_millis(120);
 /// Min new chars before we push a dialogue delta (keeps feed moving without
-/// per-token spam). Lowered so partial sentences still stream live.
-const DIALOGUE_MIN_DELTA: usize = 6;
+/// per-token spam). Low so partial sentences still stream live.
+const DIALOGUE_MIN_DELTA: usize = 3;
 /// Max chars of a single dialogue push (keep the feed readable).
-const DIALOGUE_MAX_CHUNK: usize = 280;
+const DIALOGUE_MAX_CHUNK: usize = 320;
+/// Thought narration min chars (workers think more than they talk mid-turn).
+const THOUGHT_MIN_DELTA: usize = 48;
+/// Cap thought dumps so the feed stays readable.
+const THOUGHT_MAX_CHUNK: usize = 220;
+/// After a worker finishes, re-poll a few times for late-flush speech/edits.
+const COMPLETION_FLUSH_RETRIES: u32 = 6;
+const COMPLETION_FLUSH_GAP: Duration = Duration::from_millis(80);
 
 // ── Council (Heavy / Swarm Heavy) ───────────────────────────────────────────
 
@@ -132,7 +139,8 @@ const STAGES: &[Stage] = &[
         system_lens: "\
 You are RESEARCH for the multi-agent captain.
 - Follow the captain brief.
-- Deepen investigation with tools; do NOT implement.",
+- Deepen investigation with tools; do NOT implement.
+- Narrate briefly as you work so the parent chat stays live.",
     },
     Stage {
         id_suffix: "implement",
@@ -142,7 +150,8 @@ You are RESEARCH for the multi-agent captain.
         system_lens: "\
 You are IMPLEMENT for the multi-agent captain.
 - Follow the captain brief and prior board.
-- Make real edits; minimize scope; summarize changes.",
+- Make real edits; minimize scope; summarize changes.
+- Narrate briefly as you work (what you're reading, what you're changing) so the parent chat stays live.",
     },
     Stage {
         id_suffix: "test",
@@ -151,7 +160,8 @@ You are IMPLEMENT for the multi-agent captain.
         capability: CapMode::Execute,
         system_lens: "\
 You are TEST/VERIFY for the multi-agent captain.
-- Run checks/tests when possible; report pass/fail and residual risks.",
+- Run checks/tests when possible; report pass/fail and residual risks.
+- Narrate briefly as you verify so the parent chat stays live.",
     },
 ];
 
@@ -1249,37 +1259,64 @@ fn render_board(title: &str, cells: &BTreeMap<String, (Cell, String)>) -> String
     s
 }
 
-/// Track live speech from each worker so the parent feed can show
-/// `**◈ Analyst**` / `**◈ Skeptic**` turns as they talk (Grok Heavy style).
+/// Track live speech + tool events from each worker so the parent feed shows
+/// talk and edits as if one agent were doing the work (Grok Heavy style).
 struct DialogueState {
     /// child_session_id (spawn id) → display label
     speakers: Vec<(String, String)>,
-    /// label → chars already pushed to parent
+    /// label → spoken chars already pushed to parent
     emitted_len: BTreeMap<String, usize>,
+    /// label → thought chars already pushed to parent
+    thought_emitted_len: BTreeMap<String, usize>,
     /// last speaker we emitted for (so we re-header only on switch)
     current_speaker: Option<String>,
-    /// cached session dirs once found
-    dir_cache: BTreeMap<String, Option<std::path::PathBuf>>,
+    /// child_id → session dir (only cache hits; never cache misses)
+    dir_cache: BTreeMap<String, std::path::PathBuf>,
+    /// child_id → updates.jsonl lines already processed for tool mirroring
+    tool_line_cursor: BTreeMap<String, usize>,
+    /// single-worker mode (sequential stages): mirror all tools, not just edits
+    mirror_all_tools: bool,
 }
 
 impl DialogueState {
     fn new(speakers: Vec<(String, String)>) -> Self {
+        let mirror_all_tools = speakers.len() <= 1;
         Self {
             speakers,
             emitted_len: BTreeMap::new(),
+            thought_emitted_len: BTreeMap::new(),
             current_speaker: None,
             dir_cache: BTreeMap::new(),
+            tool_line_cursor: BTreeMap::new(),
+            mirror_all_tools,
         }
     }
 
     fn child_dir(&mut self, child_id: &str) -> Option<std::path::PathBuf> {
         if let Some(cached) = self.dir_cache.get(child_id) {
-            return cached.clone();
+            return Some(cached.clone());
         }
-        let found = crate::session::persistence::find_session_dir_by_id(child_id);
-        self.dir_cache.insert(child_id.to_string(), found.clone());
-        found
+        // Important: do NOT cache misses — session dir often appears a few
+        // hundred ms after spawn. Caching None permanently silenced sequential
+        // workers (implement/test) in the parent feed.
+        let found = crate::session::persistence::find_session_dir_by_id(child_id)?;
+        self.dir_cache
+            .insert(child_id.to_string(), found.clone());
+        Some(found)
     }
+}
+
+/// Extract text content from a session update value for a given kind.
+fn update_text(update: &serde_json::Value) -> Option<&str> {
+    update.pointer("/content/text").and_then(|x| x.as_str())
+}
+
+fn update_kind(update: &serde_json::Value) -> &str {
+    update
+        .get("sessionUpdate")
+        .or_else(|| update.get("session_update"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
 }
 
 /// Pull spoken assistant text so far from a child session (updates.jsonl).
@@ -1298,22 +1335,95 @@ fn read_child_spoken_text(dir: &std::path::Path) -> String {
             .or_else(|| v.get("update"))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let kind = update
-            .get("sessionUpdate")
-            .or_else(|| update.get("session_update"))
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
-        if kind != "agent_message_chunk" {
+        if update_kind(&update) != "agent_message_chunk" {
             continue;
         }
-        if let Some(t) = update
-            .pointer("/content/text")
-            .and_then(|x| x.as_str())
-        {
+        if let Some(t) = update_text(&update) {
             out.push_str(t);
         }
     }
     out
+}
+
+/// Pull agent thought text (workers often "think" more than they speak mid-turn).
+fn read_child_thought_text(dir: &std::path::Path) -> String {
+    let path = dir.join("updates.jsonl");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for line in raw.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let update = v
+            .pointer("/params/update")
+            .or_else(|| v.get("update"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if update_kind(&update) != "agent_thought_chunk" {
+            continue;
+        }
+        if let Some(t) = update_text(&update) {
+            out.push_str(t);
+        }
+    }
+    out
+}
+
+/// Whether this child tool event should be re-emitted on the parent feed.
+/// Edits always; executes always; other tools only in single-worker mode so
+/// parallel council doesn't flood with 4× reads.
+fn should_mirror_tool(update: &serde_json::Value, mirror_all: bool) -> bool {
+    let kind = update_kind(update);
+    if kind != "tool_call" && kind != "tool_call_update" {
+        return false;
+    }
+    if mirror_all {
+        return true;
+    }
+    // Parallel multi-agent: only surface edits (and their updates).
+    let tool_kind = update
+        .get("kind")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    if tool_kind.eq_ignore_ascii_case("edit")
+        || tool_kind.eq_ignore_ascii_case("delete")
+        || tool_kind.eq_ignore_ascii_case("move")
+        || tool_kind.eq_ignore_ascii_case("write")
+    {
+        return true;
+    }
+    // Early tool_call rows often have empty kind — inspect title / rawInput.
+    let title = update
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if title.contains("search_replace")
+        || title.contains("write")
+        || title.starts_with("edit ")
+        || title.contains("edit `")
+    {
+        return true;
+    }
+    let raw = update.get("rawInput").or_else(|| update.get("raw_input"));
+    if let Some(obj) = raw.and_then(|v| v.as_object()) {
+        if obj.contains_key("old_string")
+            || obj.contains_key("new_string")
+            || obj.contains_key("contents")
+            || obj.contains_key("content") && obj.contains_key("file_path")
+        {
+            return true;
+        }
+        if let Some(v) = obj.get("variant").and_then(|x| x.as_str()) {
+            let v = v.to_ascii_lowercase();
+            if v.contains("replace") || v.contains("write") || v.contains("edit") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Format one spoken chunk. Always labels the speaker so the feed reads like:
@@ -1335,58 +1445,168 @@ fn format_speaker_chunk(label: &str, text: &str, switched: bool) -> String {
     }
 }
 
-/// Emit new speech; re-label whenever the speaker changes.
+fn format_thought_chunk(label: &str, text: &str, switched: bool) -> String {
+    let body = text.trim();
+    if body.is_empty() {
+        return String::new();
+    }
+    // Collapse internal whitespace for compact mid-work narration.
+    let compact: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if switched {
+        format!("▸ **{label}** · _{compact}_\n")
+    } else {
+        format!("  _{compact}_\n")
+    }
+}
+
+fn take_char_delta(full: &str, already: usize, max: usize, min: usize, force: bool) -> Option<(String, usize)> {
+    let full_chars: Vec<char> = full.chars().collect();
+    if full_chars.len() <= already {
+        return None;
+    }
+    let mut delta: String = full_chars[already..].iter().collect();
+    if delta.chars().count() > max {
+        let cut = delta
+            .char_indices()
+            .take_while(|(i, _)| *i < max)
+            .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '\n' | ' ' | ',' | ';'))
+            .map(|(i, _)| i + 1)
+            .last()
+            .unwrap_or(max);
+        delta = delta.chars().take(cut).collect();
+    }
+    if !force
+        && delta.chars().count() < min
+        && !delta.contains('\n')
+        && !delta.ends_with('.')
+        && !delta.ends_with('!')
+        && !delta.ends_with('?')
+        && !delta.ends_with(' ')
+    {
+        return None;
+    }
+    if delta.trim().is_empty() {
+        return None;
+    }
+    let n = delta.chars().count();
+    Some((delta, already + n))
+}
+
+/// Re-emit new tool_call / tool_call_update rows from the child into the parent
+/// so edits render in the main scrollback like a single agent did the work.
+async fn emit_tool_mirrors(actor: &SessionActor, state: &mut DialogueState, child_id: &str, dir: &std::path::Path) {
+    let path = dir.join("updates.jsonl");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let lines: Vec<&str> = raw.lines().collect();
+    let start = state.tool_line_cursor.get(child_id).copied().unwrap_or(0);
+    if start >= lines.len() {
+        return;
+    }
+    let mirror_all = state.mirror_all_tools;
+    for (idx, line) in lines.iter().enumerate().skip(start) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let update = v
+            .pointer("/params/update")
+            .or_else(|| v.get("update"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if !should_mirror_tool(&update, mirror_all) {
+            continue;
+        }
+        // Deserialize into ACP SessionUpdate and re-emit on the parent session.
+        match serde_json::from_value::<acp::SessionUpdate>(update) {
+            Ok(acp::SessionUpdate::ToolCall(tc)) => {
+                actor
+                    .send_update(acp::SessionUpdate::ToolCall(tc), None)
+                    .await;
+            }
+            Ok(acp::SessionUpdate::ToolCallUpdate(tcu)) => {
+                actor
+                    .send_update(acp::SessionUpdate::ToolCallUpdate(tcu), None)
+                    .await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    child_id,
+                    line = idx,
+                    "dialogue: skip unparseable child tool event"
+                );
+            }
+        }
+    }
+    state
+        .tool_line_cursor
+        .insert(child_id.to_string(), lines.len());
+}
+
+/// Emit new speech, thoughts, and mirrored tool events for all tracked workers.
 async fn emit_dialogue_deltas(actor: &SessionActor, state: &mut DialogueState) {
+    emit_dialogue_deltas_inner(actor, state, false).await;
+}
+
+async fn emit_dialogue_deltas_inner(actor: &SessionActor, state: &mut DialogueState, force: bool) {
     for (child_id, label) in state.speakers.clone() {
         let Some(dir) = state.child_dir(&child_id) else {
             continue;
         };
-        let full = read_child_spoken_text(&dir);
-        if full.is_empty() {
-            continue;
-        }
-        // Track by char count so UTF-8 never panics on mid-char slices.
+
+        // 1) Tool / edit mirroring first so diffs appear as they land.
+        emit_tool_mirrors(actor, state, &child_id, &dir).await;
+
+        // 2) Spoken assistant text.
+        let spoken = read_child_spoken_text(&dir);
         let already = state.emitted_len.get(&label).copied().unwrap_or(0);
-        let full_chars: Vec<char> = full.chars().collect();
-        if full_chars.len() <= already {
-            continue;
-        }
-        let mut delta: String = full_chars[already..].iter().collect();
-        if delta.chars().count() > DIALOGUE_MAX_CHUNK {
-            let cut = delta
-                .char_indices()
-                .take_while(|(i, _)| *i < DIALOGUE_MAX_CHUNK)
-                .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '\n' | ' '))
-                .map(|(i, _)| i + 1)
-                .last()
-                .unwrap_or(DIALOGUE_MAX_CHUNK);
-            delta = delta.chars().take(cut).collect();
-        }
-        if delta.chars().count() < DIALOGUE_MIN_DELTA
-            && !delta.contains('\n')
-            && !delta.ends_with('.')
-            && !delta.ends_with('!')
-            && !delta.ends_with('?')
-            && !delta.ends_with(' ')
+        if let Some((delta, new_len)) =
+            take_char_delta(&spoken, already, DIALOGUE_MAX_CHUNK, DIALOGUE_MIN_DELTA, force)
         {
-            continue;
-        }
-        if delta.trim().is_empty() {
-            continue;
+            let switch = state.current_speaker.as_deref() != Some(label.as_str());
+            let piece = format_speaker_chunk(&label, &delta, switch);
+            if !piece.is_empty() {
+                if switch {
+                    state.current_speaker = Some(label.clone());
+                }
+                actor.emit_agent_text_raw(&piece).await;
+                state.emitted_len.insert(label.clone(), new_len);
+            }
         }
 
-        let switch = state.current_speaker.as_deref() != Some(label.as_str());
-        let piece = format_speaker_chunk(&label, &delta, switch);
-        if piece.is_empty() {
-            continue;
+        // 3) Thought narration when they aren't talking yet (fills silence
+        // while tools run). Prefer real speech over thoughts.
+        let thought = read_child_thought_text(&dir);
+        let t_already = state.thought_emitted_len.get(&label).copied().unwrap_or(0);
+        let spoken_pending =
+            spoken.chars().count() > state.emitted_len.get(&label).copied().unwrap_or(0);
+        let allow_thought = if force {
+            // On final flush, only surface thoughts if this agent never spoke.
+            spoken.trim().is_empty()
+        } else {
+            !spoken_pending
+        };
+        if allow_thought {
+            if let Some((delta, new_len)) = take_char_delta(
+                &thought,
+                t_already,
+                THOUGHT_MAX_CHUNK,
+                THOUGHT_MIN_DELTA,
+                force,
+            ) {
+                let switch = state.current_speaker.as_deref() != Some(label.as_str());
+                let piece = format_thought_chunk(&label, &delta, switch);
+                if !piece.is_empty() {
+                    if switch {
+                        state.current_speaker = Some(label.clone());
+                    }
+                    actor.emit_agent_text_raw(&piece).await;
+                    state.thought_emitted_len.insert(label.clone(), new_len);
+                }
+            }
         }
-        if switch {
-            state.current_speaker = Some(label.clone());
-        }
-        // Stream without extra blank-line padding so speech feels continuous.
-        actor.emit_agent_text_raw(&piece).await;
-        let new_len = already + delta.chars().count();
-        state.emitted_len.insert(label, new_len);
     }
 }
 
@@ -1475,7 +1695,7 @@ async fn run_parallel_units(
         tokio::select! {
             biased;
             Some((label, res)) = futs.next() => {
-                // Flush residual speech (including tiny trailing fragments).
+                // Flush residual speech + late tool events (disk flush race).
                 force_flush_dialogue(actor, &mut dialogue).await;
                 match &res {
                     Ok(r) if r.success => {
@@ -1509,6 +1729,8 @@ async fn run_parallel_units(
             }
         }
     }
+    // Final pass: catch speech/edits that landed after the last result_rx.
+    force_flush_dialogue(actor, &mut dialogue).await;
     out
 }
 
@@ -1740,7 +1962,7 @@ async fn spawn_and_wait_dialogue(
     loop {
         tokio::select! {
             res = &mut result_rx => {
-                // Flush residual including tiny trailing fragments.
+                // Flush residual speech/edits including late disk writes.
                 force_flush_dialogue(actor, &mut dialogue).await;
                 return res.map_err(|_| "subagent result channel dropped".to_string());
             }
@@ -1751,33 +1973,31 @@ async fn spawn_and_wait_dialogue(
     }
 }
 
-/// Final flush: emit remaining text even if under min-delta.
+/// Final flush: emit remaining text/tools even if under min-delta.
+/// Retries briefly — child sessions often finish the result channel a few
+/// dozen ms before the last agent_message / tool_call_update hits disk.
 async fn force_flush_dialogue(actor: &SessionActor, state: &mut DialogueState) {
-    for (child_id, label) in state.speakers.clone() {
-        let Some(dir) = state.child_dir(&child_id) else {
-            continue;
-        };
-        let full = read_child_spoken_text(&dir);
-        let already = state.emitted_len.get(&label).copied().unwrap_or(0);
-        let full_chars: Vec<char> = full.chars().collect();
-        if full_chars.len() <= already {
-            continue;
+    for attempt in 0..COMPLETION_FLUSH_RETRIES {
+        emit_dialogue_deltas_inner(actor, state, true).await;
+        // Drain multi-chunk residuals (spoken can exceed MAX_CHUNK).
+        for _ in 0..8 {
+            let before_spoken: usize = state.emitted_len.values().sum();
+            let before_thought: usize = state.thought_emitted_len.values().sum();
+            let before_tools: usize = state.tool_line_cursor.values().sum();
+            emit_dialogue_deltas_inner(actor, state, true).await;
+            let after_spoken: usize = state.emitted_len.values().sum();
+            let after_thought: usize = state.thought_emitted_len.values().sum();
+            let after_tools: usize = state.tool_line_cursor.values().sum();
+            if after_spoken == before_spoken
+                && after_thought == before_thought
+                && after_tools == before_tools
+            {
+                break;
+            }
         }
-        let delta: String = full_chars[already..].iter().collect();
-        let delta = delta.trim();
-        if delta.is_empty() {
-            continue;
+        if attempt + 1 < COMPLETION_FLUSH_RETRIES {
+            tokio::time::sleep(COMPLETION_FLUSH_GAP).await;
         }
-        let switch = state.current_speaker.as_deref() != Some(label.as_str());
-        let piece = format_speaker_chunk(&label, delta, switch);
-        if piece.is_empty() {
-            continue;
-        }
-        if switch {
-            state.current_speaker = Some(label.clone());
-        }
-        actor.emit_agent_text_raw(&piece).await;
-        state.emitted_len.insert(label, full_chars.len());
     }
 }
 
