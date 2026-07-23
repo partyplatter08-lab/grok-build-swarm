@@ -281,41 +281,42 @@ impl SessionActor {
                 .handle_direct_bash_command(prompt_id, bash_command, &prompt_blocks)
                 .await;
         }
-        // Multi-agent effort modes: code-enforced pipeline every user turn
-        // while SessionActor.orchestration_mode is Heavy/Swarm/SwarmHeavy.
-        // NOT gated on system-prompt text (that demoted to single-agent over time).
-        // Skip only for plan mode — plan needs the normal tool/reminder path.
+        // Multi-agent effort modes: code-enforced pipeline on **every** real
+        // user turn while Heavy / Swarm / Swarm Heavy is selected.
+        // Plan mode must NOT demote to single-agent — that made the main
+        // agent "take over" mid-session. Workers can still write plan files.
+        // Synthetic wakes (subagent completion reminders) stay single-path.
         if !origin.is_synthetic() && self.should_run_heavy_pipeline().await {
-            let plan_blocks_swarm = {
-                use crate::session::plan_mode::{PlanModeState, PromptMode};
-                let state = self.plan_mode.lock().state();
-                matches!(
-                    state,
-                    PlanModeState::Pending | PlanModeState::Active | PlanModeState::ExitPending
-                ) || matches!(prompt_mode, PromptMode::Plan)
-            };
-            if plan_blocks_swarm {
+            let user_text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
+                if let acp::ContentBlock::Text(t) = b {
+                    if !acc.is_empty() {
+                        acc.push('\n');
+                    }
+                    acc.push_str(&t.text);
+                }
+                acc
+            });
+            if !user_text.trim().is_empty() {
+                // Persist the real user turn *before* the pipeline short-circuit
+                // so titles/history are not stolen by later synthetic wakes.
+                self.persist_user_prompt_for_session(prompt_id, &prompt_blocks)
+                    .await;
+                let plan_note = {
+                    use crate::session::plan_mode::{PlanModeState, PromptMode};
+                    let state = self.plan_mode.lock().state();
+                    matches!(
+                        state,
+                        PlanModeState::Pending
+                            | PlanModeState::Active
+                            | PlanModeState::ExitPending
+                    ) || matches!(prompt_mode, PromptMode::Plan)
+                };
                 tracing::info!(
                     session_id = %self.session_info.id.0,
-                    "orchestration: multi-agent mode active but plan mode owns this turn"
+                    plan_mode_active = plan_note,
+                    "orchestration: running code-enforced multi-agent pipeline (every user turn)"
                 );
-            } else {
-                let user_text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
-                    if let acp::ContentBlock::Text(t) = b {
-                        if !acc.is_empty() {
-                            acc.push('\n');
-                        }
-                        acc.push_str(&t.text);
-                    }
-                    acc
-                });
-                if !user_text.trim().is_empty() {
-                    tracing::info!(
-                        session_id = %self.session_info.id.0,
-                        "orchestration: running code-enforced multi-agent pipeline"
-                    );
-                    return self.run_heavy_pipeline(prompt_id, user_text.trim()).await;
-                }
+                return self.run_heavy_pipeline(prompt_id, user_text.trim()).await;
             }
         }
         let slash_skills = self
@@ -1273,6 +1274,65 @@ impl SessionActor {
             Err(()) => crate::extensions::notification::PromptUsage::for_error_path(None, true),
         }
     }
+    /// Persist a real user prompt when the multi-agent pipeline short-circuits
+    /// the normal turn path. Mirrors the user-echo + title ContentChunk steps
+    /// so session list titles and history are not stolen by later synthetic
+    /// subagent-completion wakes.
+    async fn persist_user_prompt_for_session(
+        &self,
+        prompt_id: &str,
+        prompt_blocks: &[acp::ContentBlock],
+    ) {
+        let model_id = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|c| c.model)
+            .unwrap_or_default();
+        let current_prompt_index = self.chat_state_handle.get_prompt_index().await;
+        let mut chunk_meta = serde_json::Map::new();
+        chunk_meta.insert("modelId".into(), serde_json::json!(model_id));
+        chunk_meta.insert(
+            "promptIndex".into(),
+            serde_json::json!(current_prompt_index),
+        );
+        let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
+        if origin.hide_user_echo_from_scrollback() {
+            chunk_meta.insert("hideFromScrollback".into(), serde_json::json!(true));
+        }
+        let user_chunk_meta = Some(chunk_meta);
+        self.chat_state_handle.increment_prompt_index();
+        let text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
+            if let acp::ContentBlock::Text(t) = b {
+                acc.push_str(&t.text);
+            }
+            acc
+        });
+        let trimmed = text.trim().to_string();
+        if !trimmed.is_empty() {
+            self.chat_state_handle.cache_prompt_text(trimmed);
+        }
+        *self.tool_context.prompt_index.lock().await = current_prompt_index;
+        for block in prompt_blocks.iter() {
+            let update = acp::SessionUpdate::UserMessageChunk(
+                acp::ContentChunk::new(block.clone()).meta(user_chunk_meta.clone()),
+            );
+            let notification_meta = self.build_notification_meta();
+            let notification = acp::SessionNotification::new(self.session_info.id.clone(), update)
+                .meta(notification_meta.as_object().cloned());
+            // Pipeline path always wants the real user turn visible + durable.
+            self.emit_notification_direct(notification).await;
+        }
+        // Drive session title generation from the real user text (not later
+        // synthetic system-reminder wakes).
+        let _ = self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::ContentChunk(PersistenceContentChunk::new(
+                prompt_blocks.to_vec(),
+            )));
+    }
+
     /// Sticky incomplete for `prompt_id`, or the live pin when `None`.
     /// Returns true only if the coordinator acked the mark.
     pub(super) async fn mark_subagent_usage_not_applied(&self, prompt_id: Option<&str>) -> bool {

@@ -187,7 +187,8 @@ impl SessionActor {
     ///
     /// Order of truth:
     /// 1. `SessionActor.orchestration_mode` — set by effort menu / resume (code path)
-    /// 2. Legacy heal: system-prompt protocol markers from older builds
+    /// 2. Durable `summary.json` orchestration_mode (resume / process restart)
+    /// 3. Legacy heal: system-prompt protocol markers from older builds
     ///
     /// Never derive mode from system text alone when the actor field is set —
     /// prompt rewrites / compaction used to demote Heavy to single-agent.
@@ -202,6 +203,18 @@ impl SessionActor {
                 return OrchestrationMode::Normal;
             }
             // Unknown id still Normal
+            return mode;
+        }
+        // Heal from durable summary (old sessions / resume before set_session_model).
+        if let Some(mode) = self.orchestration_mode_from_summary_file() {
+            if let Some(oid) = mode.option_id() {
+                *self.orchestration_mode.lock() = Some(oid.to_string());
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    mode = %mode,
+                    "orchestration: healed multi-agent mode from summary.json into session state"
+                );
+            }
             return mode;
         }
         // Heal legacy sessions that only have protocol text in the system head.
@@ -241,12 +254,32 @@ impl SessionActor {
         OrchestrationMode::Normal
     }
 
+    /// Read multi-agent mode from this session's summary.json (if any).
+    fn orchestration_mode_from_summary_file(&self) -> Option<OrchestrationMode> {
+        let path = crate::session::persistence::session_dir(&self.session_info)
+            .join("summary.json");
+        let bytes = std::fs::read(&path).ok()?;
+        let summary: crate::session::persistence::Summary =
+            serde_json::from_slice(&bytes).ok()?;
+        let id = summary.orchestration_mode?;
+        let mode = OrchestrationMode::from_option_id(&id);
+        mode.is_multi_agent().then_some(mode)
+    }
+
     pub(super) async fn run_heavy_pipeline(
         self: &Arc<Self>,
         prompt_id: &str,
         user_text: &str,
     ) -> PromptTurnResult {
         let mode = self.current_orchestration_mode().await;
+        if !mode.is_multi_agent() {
+            // Should never run — belt and suspenders.
+            tracing::error!(
+                session_id = %self.session_info.id.0,
+                "run_heavy_pipeline called without multi-agent mode"
+            );
+            return commands::ok_end_turn(0, None);
+        }
         let Some(event_tx) = self.tool_context.subagent_event_tx.clone() else {
             tracing::warn!(
                 session_id = %self.session_info.id.0,
@@ -267,10 +300,18 @@ impl SessionActor {
             &prompt_id.replace('-', "")[..8.min(prompt_id.len())]
         );
 
-        // Visual open: mode banner box (always — looks right in the TUI).
+        // Visual open: mode banner + hard reminder that this turn is multi-agent.
+        // Every user message re-enters the full collaborative pipeline — never
+        // a silent single-agent takeover.
         if let Some(banner) = mode.open_banner() {
             self.emit_agent_text(banner).await;
         }
+        self.emit_agent_text(&format!(
+            "**{} · collaborative multi-agent turn** — council debate + workers \
+             (not the solo parent agent). Mode stays on until you change effort.",
+            mode.brand()
+        ))
+        .await;
 
         match mode {
             OrchestrationMode::Swarm => {

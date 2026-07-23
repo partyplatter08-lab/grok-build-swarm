@@ -64,6 +64,15 @@ impl SummaryGenerator {
                 if content.trim().is_empty() {
                     return;
                 }
+                // Synthetic task/subagent wakes arrive as user ContentChunks
+                // with only `<system-reminder>…`. Skip them and keep Idle so a
+                // later real user prompt still titles the session.
+                if !crate::session::helpers::session_summary::is_titleable_user_text(&content) {
+                    tracing::debug!(
+                        "session title: skipping non-titleable content chunk (system-reminder / synthetic wake)"
+                    );
+                    return;
+                }
 
                 // Transition to Done so subsequent ContentChunk messages
                 // don't spawn duplicate title generation tasks.
@@ -79,11 +88,21 @@ impl SummaryGenerator {
                 tokio::spawn(async move {
                     let mut title =
                         generate_session_summary(content.clone(), sampling_client, &model).await;
-                    if title.trim().is_empty() {
+                    let looks_like_noise = |t: &str| {
+                        let lower = t.to_ascii_lowercase();
+                        t.trim().is_empty()
+                            || t.contains("<system-reminder>")
+                            || lower.contains("background subagent")
+                            || lower.contains("get_task_output")
+                    };
+                    if looks_like_noise(&title) {
                         title =
                             crate::session::helpers::session_summary::title_fallback_from_user_text(
                                 &content,
                             );
+                    }
+                    if looks_like_noise(&title) {
+                        title = "New session".to_string();
                     }
 
                     // Route the result through the persistence channel. The

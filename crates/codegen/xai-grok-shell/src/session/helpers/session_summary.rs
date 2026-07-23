@@ -39,18 +39,45 @@ fn strip_system_reminder_blocks(text: &str) -> String {
 /// Text the session title is derived from: strip system reminders and skill XML
 /// markup, then cap to the first few KB. Stripping runs before the cap so a
 /// leading reminder larger than the cap is still removed.
+///
+/// If the message is **only** system-reminder / synthetic wake noise, returns
+/// empty — callers must **not** fall back to the raw reminder text.
 fn title_source_text(user_message: &str) -> String {
     let without_reminders = strip_system_reminder_blocks(user_message);
-    let base = if without_reminders.is_empty() {
-        user_message
-    } else {
-        &without_reminders
-    };
-    let mut display =
-        xai_grok_tools::implementations::skills::skill::extract_skill_display_text(base)
-            .unwrap_or_else(|| base.to_string());
+    // Pure system-reminder (common for task/subagent auto-wakes): never title
+    // from that. Previously we fell back to the raw string and sessions got
+    // named e.g. `<system-reminder> Background subagent "council-…" completed`.
+    if without_reminders.is_empty() {
+        return String::new();
+    }
+    let mut display = xai_grok_tools::implementations::skills::skill::extract_skill_display_text(
+        &without_reminders,
+    )
+    .unwrap_or(without_reminders);
+    if is_synthetic_title_noise(&display) {
+        return String::new();
+    }
     display.truncate(floor_char_boundary(&display, TITLE_SOURCE_MAX_BYTES));
     display
+}
+
+/// Synthetic / internal wake text that must never become a session title.
+fn is_synthetic_title_noise(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    lower.starts_with("<system-reminder>")
+        || lower.contains("background subagent")
+        || (lower.contains("subagent \"") && lower.contains("completed"))
+        || lower.contains("use get_task_output")
+        || lower.contains("use get_command_or_subagent_output")
+}
+
+/// Whether `user_message` is suitable to drive auto-title (real user text).
+pub(crate) fn is_titleable_user_text(user_message: &str) -> bool {
+    !title_source_text(user_message).trim().is_empty()
 }
 
 pub(crate) fn title_fallback_from_user_text(user_message: &str) -> String {
@@ -188,6 +215,35 @@ mod tests {
             strip_system_reminder_blocks("<system-reminder>\nrules with no close tag"),
             ""
         );
+    }
+
+    #[test]
+    fn pure_system_reminder_does_not_title() {
+        let wake = r#"<system-reminder>
+Background subagent "council-p1-skeptic-019f9066-ad5cd6e9" (explore: "[SH/H1·Skeptic] first pass") completed successfully.
+Duration: 155.4s | Tool calls: 39 | Turns: 1
+Use get_task_output("council-p1-skeptic-019f9066-ad5cd6e9") to see the full output.
+</system-reminder>"#;
+        assert!(title_source_text(wake).is_empty());
+        assert!(!super::is_titleable_user_text(wake));
+        // Fallback must not echo the reminder either.
+        assert_eq!(title_fallback_from_user_text(wake), "New session");
+    }
+
+    #[test]
+    fn real_user_prompt_still_titles() {
+        let msg = "Please take a look at this system. Both the mobile and desktop version.";
+        assert!(super::is_titleable_user_text(msg));
+        assert!(title_fallback_from_user_text(msg).contains("look"));
+    }
+
+    /// Regression: empty after strip used to fall back to the raw reminder.
+    #[test]
+    fn title_source_never_returns_raw_reminder() {
+        let only = "<system-reminder>\nBackground subagent done\n</system-reminder>";
+        let out = title_source_text(only);
+        assert!(!out.contains("system-reminder"));
+        assert!(!out.contains("Background subagent"));
     }
 
     #[test]
