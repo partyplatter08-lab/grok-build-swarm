@@ -200,16 +200,43 @@ pub fn context_bar_line_for_session(
     theme: &Theme,
     gateway_chat: bool,
 ) -> Option<Line<'static>> {
+    context_bar_line_with_agents(used_tokens, total_tokens, &[], hovered, theme, gateway_chat)
+}
+
+/// Context bar with optional multi-agent token breakdown.
+///
+/// - **Default:** parent session tokens (`used / total`) — this is what the
+///   parent model actually sees on the **next** turn.
+/// - When `agents` is non-empty and any have tokens: append ` · +work` so it
+///   is obvious workers burned context too.
+/// - **Hover:** parent pct bar, or when agents present a compact breakdown
+///   (`parent · N agents · total work`).
+///
+/// `agents` is `(display_name, tokens_used)` for each subagent that reported
+/// usage. Finished and running agents both count as *work done*, not as the
+/// parent's live context window.
+pub fn context_bar_line_with_agents(
+    used_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    agents: &[(String, u64)],
+    hovered: bool,
+    theme: &Theme,
+    gateway_chat: bool,
+) -> Option<Line<'static>> {
     if gateway_chat {
         return None;
     }
     let used = used_tokens?;
     let total = total_tokens.filter(|&t| t > 0)?;
     let pct = xai_token_estimation::usage_percentage(used, total);
+    let agent_work: u64 = agents.iter().map(|(_, t)| *t).sum();
+    let agent_n = agents.iter().filter(|(_, t)| *t > 0).count();
 
-    // Default form drives the line width: `used / total`, right-padded to the
-    // minimum hover width so the two states always render at the same width.
+    // Default form drives the line width: `used / total` [· +work].
     let mut token_str = format!("{} / {}", fmt_tokens(used), fmt_tokens(total));
+    if agent_work > 0 {
+        token_str.push_str(&format!(" · +{}", fmt_tokens(agent_work)));
+    }
     let natural_width = token_str.chars().count() as u16;
     let min_width = BAR_PCT_GAP + PCT_WIDTH;
     if natural_width < min_width {
@@ -223,6 +250,44 @@ pub fn context_bar_line_for_session(
     let color = crate::theme::quantize(blend_color(pct, &breakpoints));
 
     if hovered {
+        if agent_work > 0 {
+            // Multi-agent breakdown instead of the bare fill bar.
+            let mut detail = format!(
+                "parent {} · {} agent{} {} · work {}",
+                fmt_tokens(used),
+                agent_n,
+                if agent_n == 1 { "" } else { "s" },
+                fmt_tokens(agent_work),
+                fmt_tokens(used.saturating_add(agent_work)),
+            );
+            // Prefer naming a few agents when they fit.
+            if agents.len() <= 4 {
+                let named: Vec<String> = agents
+                    .iter()
+                    .filter(|(_, t)| *t > 0)
+                    .map(|(n, t)| format!("{n} {}", fmt_tokens(*t)))
+                    .collect();
+                if !named.is_empty() {
+                    let candidate = named.join(" · ");
+                    if candidate.chars().count() as u16 <= total_width.saturating_add(8) {
+                        detail = candidate;
+                    }
+                }
+            }
+            let detail = crate::render::line_utils::truncate_str(&detail, total_width as usize);
+            // Pad so layout width matches default.
+            let mut detail = detail;
+            let dw = detail.chars().count() as u16;
+            if dw < total_width {
+                detail.push_str(&" ".repeat((total_width - dw) as usize));
+            }
+            return Some(Line::from(Span::styled(
+                detail,
+                Style::default()
+                    .fg(theme.text_secondary)
+                    .bg(theme.bg_base),
+            )));
+        }
         // Bar fills the space the default tokens would occupy, minus the gap
         // and the percentage. `total_width >= min_width` by construction, so
         // this subtraction is safe.

@@ -580,10 +580,27 @@ impl AgentView {
     /// For `Waiting(TaskOutput { task_ids, .. })`, also resolves a display
     /// `subject` from live bg-task / subagent state (description preferred,
     /// else command) so the spinner can read `{description}…`.
+    ///
+    /// Multi-agent pipelines (Heavy / Swarm) keep the parent in `TurnRunning`
+    /// while workers run as **background** subagents. The tracker still reports
+    /// `Responding`/`Thinking` from the last captain token or falls through to
+    /// `Waiting(Model)`. When any subagent is running we prefer a live
+    /// multi-agent activity line (counts + worker labels + worker activity).
     pub(crate) fn resolve_turn_activity(&self) -> Option<crate::acp::tracker::TurnActivity> {
         use crate::acp::tracker::{TurnActivity, WaitingReason};
         use crate::app::agent::AgentState;
         if let Some(activity) = self.session.turn_activity() {
+            // Soft parent-stream activities yield to live multi-agent work.
+            if matches!(
+                activity,
+                TurnActivity::Responding
+                    | TurnActivity::Thinking
+                    | TurnActivity::Waiting(WaitingReason::Model)
+                    | TurnActivity::Waiting(WaitingReason::Subagent)
+            ) && let Some(multi) = self.activity_for_running_subagents()
+            {
+                return Some(multi);
+            }
             return Some(self.enrich_waiting_activity(activity));
         }
         if !matches!(self.session.state, AgentState::TurnRunning) {
@@ -592,12 +609,76 @@ impl AgentView {
         if self.bash_turn {
             return None;
         }
+        if let Some(multi) = self.activity_for_running_subagents() {
+            return Some(multi);
+        }
         let reason = if self.has_running_foreground_subagent() {
             WaitingReason::Subagent
         } else {
             WaitingReason::Model
         };
         Some(TurnActivity::Waiting(reason))
+    }
+
+    /// Live status while one or more subagents are running (foreground or
+    /// background). Prefer a worker's `activity_label` so the status line
+    /// shows real work ("Analyst: Reading auth.rs") instead of bare
+    /// "Responding…".
+    fn activity_for_running_subagents(&self) -> Option<crate::acp::tracker::TurnActivity> {
+        use crate::acp::tracker::{TurnActivity, WaitingReason};
+        use crate::app::subagent::format_subagent_label;
+        let running: Vec<_> = self
+            .subagent_sessions
+            .values()
+            .filter(|s| s.is_running())
+            .collect();
+        if running.is_empty() {
+            return None;
+        }
+        let n = running.len();
+        // Prefer a worker that is reporting concrete activity.
+        if let Some((name, act)) = running.iter().find_map(|s| {
+            let act = s.activity_label.as_deref()?.trim();
+            if act.is_empty() {
+                return None;
+            }
+            Some((format_subagent_label(s).0, act.to_string()))
+        }) {
+            let desc = if n == 1 {
+                format!("{name}: {act}")
+            } else {
+                format!("{n} agents · {name}: {act}")
+            };
+            return Some(TurnActivity::ToolRunning {
+                title: "subagents".into(),
+                description: Some(desc),
+            });
+        }
+        // No activity labels yet — name the workers.
+        let names: Vec<String> = running
+            .iter()
+            .take(3)
+            .map(|s| format_subagent_label(s).0)
+            .collect();
+        let subject = if n == 1 {
+            names.first().cloned().unwrap_or_else(|| "subagent".into())
+        } else if n <= 3 {
+            format!("{n} agents ({})", names.join(", "))
+        } else {
+            format!(
+                "{n} agents ({} +{} more)",
+                names.join(", "),
+                n.saturating_sub(3)
+            )
+        };
+        Some(TurnActivity::Waiting(WaitingReason::TaskOutput {
+            task_ids: running
+                .iter()
+                .map(|s| s.child_session_id.to_string())
+                .collect(),
+            subject: Some(subject),
+            waits: true,
+        }))
     }
     /// Fill in a `TaskOutput` wait's display subject from live task state.
     fn enrich_waiting_activity(

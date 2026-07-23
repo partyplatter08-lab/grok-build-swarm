@@ -220,6 +220,10 @@ struct Bucket<'e> {
     /// one subagent count once; a burst of terminal rows counts each
     /// distinct subagent).
     sources: std::collections::HashSet<&'e str>,
+    /// Subagent session ids still running — used so present-tense labels
+    /// read "Running 1 of 13 subagents" instead of "Running 13 subagents"
+    /// when most of the group has already finished.
+    running_sources: std::collections::HashSet<&'e str>,
 }
 
 /// Walk the verb-group run starting at `header_idx` (same [`run_step`] rules
@@ -332,6 +336,7 @@ impl<'e> BucketAccumulator<'e> {
                     kind,
                     calls: 0,
                     sources: std::collections::HashSet::new(),
+                    running_sources: std::collections::HashSet::new(),
                 });
                 self.buckets.len() - 1
             }
@@ -356,6 +361,11 @@ impl<'e> BucketAccumulator<'e> {
             }
             RenderBlock::Subagent(sb) => {
                 bucket.sources.insert(sb.child_session_id.as_str());
+                if entry.is_running {
+                    bucket
+                        .running_sources
+                        .insert(sb.child_session_id.as_str());
+                }
                 // Cancelled is deliberate, not an error — only Failed feeds
                 // the red suffix.
                 if matches!(sb.kind, SubagentBlockKind::Failed { .. }) {
@@ -377,18 +387,45 @@ impl<'e> BucketAccumulator<'e> {
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut text = String::new();
         for (i, bucket) in self.buckets.iter().enumerate() {
-            let count = if bucket.sources.is_empty() {
+            let total = if bucket.sources.is_empty() {
                 bucket.calls
             } else {
                 bucket.sources.len()
             };
-            let segment = format!(
-                "{}{} {} {}",
-                if i == 0 { "" } else { ", " },
-                bucket.kind.verb(self.running),
-                count,
-                bucket.kind.noun(count)
-            );
+            let running_n = bucket.running_sources.len();
+            // Present-tense subagent runs: "Running 1 of 13 subagents" when
+            // most of the burst already finished (matches the top watching
+            // cue). Full "Running N" only when all N are still live.
+            let segment = if self.running
+                && matches!(bucket.kind, VerbGroupKind::Subagent)
+                && running_n > 0
+                && running_n < total
+            {
+                format!(
+                    "{}{} {} of {} {}",
+                    if i == 0 { "" } else { ", " },
+                    bucket.kind.verb(true),
+                    running_n,
+                    total,
+                    bucket.kind.noun(total)
+                )
+            } else {
+                let count = if self.running
+                    && matches!(bucket.kind, VerbGroupKind::Subagent)
+                    && running_n > 0
+                {
+                    running_n
+                } else {
+                    total
+                };
+                format!(
+                    "{}{} {} {}",
+                    if i == 0 { "" } else { ", " },
+                    bucket.kind.verb(self.running),
+                    count,
+                    bucket.kind.noun(count)
+                )
+            };
             text.push_str(&segment);
             spans.push(Span::styled(segment, text_style));
         }

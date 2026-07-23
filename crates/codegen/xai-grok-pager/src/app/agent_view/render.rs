@@ -1334,9 +1334,24 @@ impl AgentView {
             .as_ref()
             .and_then(|c| (c.total > 0).then_some(c.total))
             .or(model_window);
-        if let Some(ctx_line) = context_bar::context_bar_line_for_session(
+        // Per-agent token burn (separate sessions — not in the parent window).
+        let agent_tokens: Vec<(String, u64)> = {
+            use crate::app::subagent::format_subagent_label;
+            let mut rows: Vec<(String, u64)> = self
+                .subagent_sessions
+                .values()
+                .filter_map(|info| {
+                    let t = info.tokens_used.filter(|&n| n > 0)?;
+                    Some((format_subagent_label(info).0, t))
+                })
+                .collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            rows
+        };
+        if let Some(ctx_line) = context_bar::context_bar_line_with_agents(
             ctx_used,
             ctx_total,
+            &agent_tokens,
             self.hit_context.hovered,
             &theme,
             self.chat_kind,
