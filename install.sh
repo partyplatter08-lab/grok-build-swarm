@@ -265,11 +265,17 @@ ${MARKER_CLOSE}"
   ok "added PATH to ${config_file}"
 fi
 
-# Export for the current (piped) shell session when possible
-export PATH="${LOCAL_BIN}:${BIN_DIR}:${PATH}"
-
 ok "installed ${BIN_NAME} v${version} (${platform})"
 echo >&2
+
+# Print version via absolute path (reliable even when PATH is not ready yet)
+if [[ -x "$link" ]]; then
+  "$link" --version || true
+elif [[ -x "${LOCAL_BIN}/${BIN_NAME}" ]]; then
+  "${LOCAL_BIN}/${BIN_NAME}" --version || true
+fi
+echo >&2
+
 echo "Get started:" >&2
 echo "  ${BIN_NAME}" >&2
 echo "  ${BIN_NAME} --effort heavy" >&2
@@ -281,23 +287,29 @@ echo "  ${BIN_NAME} update" >&2
 echo "  # or re-run this installer" >&2
 echo >&2
 
-# Can we run it right now?
-if command -v "$BIN_NAME" >/dev/null 2>&1; then
-  "$BIN_NAME" --version || true
-  echo >&2
-  ok "ready — type: ${BIN_NAME}"
-elif [[ -x "$link" ]]; then
-  "$link" --version || true
-  echo >&2
-  if [[ -n "$config_file" ]]; then
-    warn "PATH updated in ${config_file}."
-    warn "Open a new terminal window, then type: ${BIN_NAME}"
-    warn "Or run now:  ${link}"
+# Was the binary already reachable on the *incoming* PATH (before we wrote rc)?
+# curl|bash runs in a subshell, so exporting PATH here never helps the parent shell.
+if path_has_dir "$LOCAL_BIN" || path_has_dir "$BIN_DIR" || [[ -n "${PATH_READY:-}" ]]; then
+  if command -v "$BIN_NAME" >/dev/null 2>&1; then
+    ok "ready — type: ${BIN_NAME}"
   else
-    warn "Add to PATH, then open a new terminal:"
-    echo "  export PATH=\"\$HOME/.local/bin:\$HOME/.grok/bin:\$PATH\"" >&2
-    warn "Or run now:  ${link}"
+    ok "installed. In this terminal run:  export PATH=\"\$HOME/.local/bin:\$HOME/.grok/bin:\$PATH\""
+    ok "then:  ${BIN_NAME}"
   fi
+elif [[ -n "$config_file" ]]; then
+  warn "PATH was written to ${config_file}."
+  warn "Open a NEW terminal window, then type:  ${BIN_NAME}"
+  echo >&2
+  echo "Or activate in this terminal now:" >&2
+  echo "  source ${config_file}" >&2
+  echo "  # or:" >&2
+  echo "  export PATH=\"\$HOME/.local/bin:\$HOME/.grok/bin:\$PATH\"" >&2
+  echo "  ${BIN_NAME}" >&2
+  echo >&2
+  echo "Or run without PATH:" >&2
+  echo "  ${LOCAL_BIN}/${BIN_NAME}" >&2
 else
-  err "install finished but binary is missing at ${link}"
+  warn "Add to PATH, then open a new terminal:"
+  echo "  export PATH=\"\$HOME/.local/bin:\$HOME/.grok/bin:\$PATH\"" >&2
+  echo "Or run:  ${LOCAL_BIN}/${BIN_NAME}" >&2
 fi
