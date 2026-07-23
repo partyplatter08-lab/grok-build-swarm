@@ -1,21 +1,29 @@
-//! Code-enforced multi-agent pipeline for Heavy / Swarm Heavy.
+//! Heavy / Swarm Heavy: **captain agent** + code-enforced workers.
 //!
-//! ## Flow
+//! ## Product shape
+//!
+//! The **parent chat is the captain** — a real model that talks to the user,
+//! decides what the workers should focus on, reacts to their results, and
+//! owns the final answer. Subagents are the captain's tools, not the show.
 //!
 //! ```text
-//! 0. Parallel COUNCIL  (Analyst · Skeptic · Explorer · Builder)  ── all at once
-//! 1. Research   (explore, read-only)     ─┐
-//! 2. Implement  (general-purpose)        ├─ sequential, each sees prior outputs
-//! 3. Test       (explore + execute)      ─┘
-//! 4. Synthesis  parent report
+//! Captain (model)  opens: frames goal, tells user the plan
+//!        │
+//!        ├─► Parallel COUNCIL  (Analyst · Skeptic · Explorer · Builder)
+//!        │     captain posts short status as each lands
+//!        │
+//! Captain (model)  cross-checks the board, sets the brief for RIT
+//!        │
+//!        ├─► Research  → captain reacts
+//!        ├─► Implement → captain reacts
+//!        └─► Test      → captain reacts
+//!        │
+//! Captain (model)  final synthesis → user-facing answer
 //! ```
 //!
-//! Council + RIT are **real** subagents via `SubagentEvent::Spawn`.
-//!
-//! Parent chat is the **captain channel** (Grok Heavy style): it narrates the
-//! plan, heartbeats while workers run, and posts clean per-member theses as
-//! they finish. Full worker thinking stays on subagent cards — not per-token
-//! dumps into the parent feed (those interleave into unreadable noise).
+//! Workers are real subagents (reliable parallel spawn). The captain is real
+//! model turns — not canned status banners. Full worker thinking stays on
+//! their cards; the parent feed is the captain's voice.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,8 +40,8 @@ use xai_tool_types::SubagentCapabilityMode as CapMode;
 use super::SessionActor;
 use crate::session::commands::{self, PromptTurnResult};
 
-/// How often the captain posts a "still working" heartbeat while council runs.
-const COUNCIL_HEARTBEAT: Duration = Duration::from_secs(5);
+/// How often the captain posts a short "still waiting" note while council runs.
+const COUNCIL_HEARTBEAT: Duration = Duration::from_secs(12);
 
 // ── Council (parallel) ──────────────────────────────────────────────────────
 
@@ -47,22 +55,22 @@ const COUNCIL: &[CouncilMember] = &[
     CouncilMember {
         id_suffix: "analyst",
         description: "[Council/Analyst] structure the problem",
-        lens: "You are the ANALYST. Structure the problem, goals, constraints, success criteria. Be precise; cite paths when relevant.",
+        lens: "You are the ANALYST on a Heavy captain's council. Structure the problem, goals, constraints, success criteria. Be precise; cite paths when relevant. The captain will synthesize — be opinionated and useful.",
     },
     CouncilMember {
         id_suffix: "skeptic",
         description: "[Council/Skeptic] attack weak assumptions",
-        lens: "You are the SKEPTIC. Attack weak assumptions, edge cases, failure modes, and overconfidence. Prefer hard questions over soft agreement.",
+        lens: "You are the SKEPTIC on a Heavy captain's council. Attack weak assumptions, edge cases, failure modes, and overconfidence. Prefer hard questions over soft agreement.",
     },
     CouncilMember {
         id_suffix: "explorer",
         description: "[Council/Explorer] find alternatives & context",
-        lens: "You are the EXPLORER. Survey the codebase/context for alternatives, prior art, and non-obvious approaches. Use tools freely (read-only).",
+        lens: "You are the EXPLORER on a Heavy captain's council. Survey the codebase/context for alternatives, prior art, and non-obvious approaches. Use tools freely (read-only).",
     },
     CouncilMember {
         id_suffix: "builder",
         description: "[Council/Builder] propose a concrete plan",
-        lens: "You are the BUILDER. Propose a concrete implementation plan (steps, files, risks). Do NOT implement yet — plan only.",
+        lens: "You are the BUILDER on a Heavy captain's council. Propose a concrete implementation plan (steps, files, risks). Do NOT implement yet — plan only.",
     },
 ];
 
@@ -83,7 +91,8 @@ const STAGES: &[Stage] = &[
         subagent_type: "explore",
         capability: CapMode::ReadOnly,
         system_lens: "\
-You are RESEARCH in a code-enforced pipeline (after a parallel council).
+You are RESEARCH working for the Heavy captain (after a parallel council).
+- Follow the captain's brief below when present.
 - Use council theses + tools to deepen investigation.
 - Produce findings, constraints, risks, recommended approach.
 - Do NOT implement code changes.",
@@ -94,7 +103,8 @@ You are RESEARCH in a code-enforced pipeline (after a parallel council).
         subagent_type: "general-purpose",
         capability: CapMode::All,
         system_lens: "\
-You are IMPLEMENT in a code-enforced pipeline.
+You are IMPLEMENT working for the Heavy captain.
+- Follow the captain's brief below when present.
 - Use council + research as your brief.
 - Implement with real edits/commands; minimize scope; summarize changes.",
     },
@@ -104,7 +114,8 @@ You are IMPLEMENT in a code-enforced pipeline.
         subagent_type: "explore",
         capability: CapMode::Execute,
         system_lens: "\
-You are TEST/VERIFY in a code-enforced pipeline.
+You are TEST/VERIFY working for the Heavy captain.
+- Follow the captain's brief below when present.
 - Review research + implement; run checks/tests when possible.
 - Report pass/fail, gaps, regressions, residual risks.",
     },
@@ -168,38 +179,41 @@ impl SessionActor {
         tracing::info!(
             session_id = %session_id,
             mode = %mode,
-            "heavy_pipeline: council + RIT start"
+            "heavy_pipeline: captain-led council + RIT start"
         );
 
-        let goal_line = first_line(user_text, 160);
-        self.emit_agent_text(&format!(
-            "{}\n\n\
-             I'll run this the way **Grok Heavy** does: same problem, many lenses, \
-             then I synthesize. You stay in this chat — I'll narrate live.\n\n\
-             **Your ask:** {goal}\n\n\
-             **Plan**\n\
-             0. **Parallel council** — Analyst · Skeptic · Explorer · Builder (all at once)\n\
-             1. **Research** — deepen with tools (read-only)\n\
-             2. **Implement** — make the change\n\
-             3. **Test** — verify\n\
-             4. **Synthesis** — my final answer from the full board\n\n\
-             Open a worker card for full thinking; I'll post theses and progress here.",
-            mode_banner(mode),
-            goal = goal_line,
-        ))
-        .await;
+        // ── Captain opens the turn (real model, not a status banner) ────
+        let open = self
+            .captain_speak(
+                CaptainPhase::Open,
+                user_text,
+                &[],
+                None,
+                1_200,
+            )
+            .await;
+        if let Some(text) = open {
+            self.emit_agent_text(&text).await;
+        } else {
+            // Fallback only if the captain model is unavailable.
+            self.emit_agent_text(&format!(
+                "{}\n\nI'm taking this as **Heavy captain** — I'll run a \
+                 multi-lens council, then research → implement → test, and \
+                 I'll keep talking to you here while workers run on cards.\n\n\
+                 **Your ask:** {}",
+                mode_banner(mode),
+                first_line(user_text, 200),
+            ))
+            .await;
+        }
 
         let mut prior: Vec<(String, String)> = Vec::new();
 
-        // ── Phase 0: parallel council ───────────────────────────────────
+        // ── Phase 0: parallel council (workers; captain stays in this chat) ─
         self.emit_agent_text(
-            "── **Phase 0 · Parallel council** ──\n\
-             Launching four lenses on the **same** problem:\n\
-             - ◈ **Analyst** — frame goals, constraints, success\n\
-             - ◈ **Skeptic** — attack weak assumptions\n\
-             - ◈ **Explorer** — alternatives & context\n\
-             - ◈ **Builder** — concrete plan\n\n\
-             Spawning all four **now**…",
+            "Putting four specialists on this **in parallel** now \
+             (Analyst · Skeptic · Explorer · Builder). Full streams are on \
+             their cards — I'll keep the board here.",
         )
         .await;
 
@@ -213,7 +227,7 @@ impl SessionActor {
         )
         .await;
 
-        let mut council_digest = String::from("## Council theses (parallel)\n\n");
+        let mut council_digest = String::from("## Council board (parallel)\n\n");
         let mut theses: Vec<(String, String)> = Vec::new();
         for (desc, result) in &council_results {
             let body = match result {
@@ -235,43 +249,61 @@ impl SessionActor {
         }
         prior.push(("council".into(), council_digest));
 
-        // Captain cross-check after the board is full.
-        let mut board = String::from(
-            "── **Council board (all in)** ──\n\
-             Here's how the four lenses landed:\n\n",
-        );
-        for (role, thesis) in &theses {
-            board.push_str(&format!("- **{role}:** {thesis}\n"));
-        }
-        board.push_str(
-            "\nI'll carry this into Research → Implement → Test. \
-             If they disagreed, the next stages must resolve it with evidence.",
-        );
-        self.emit_agent_text(&board).await;
+        // Compact board index for the captain model (not dumped raw to the user).
+        let board_index = theses
+            .iter()
+            .map(|(role, thesis)| format!("- **{role}:** {thesis}"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        // ── Phases 1–3: RIT sequential ──────────────────────────────────
-        for (idx, stage) in STAGES.iter().enumerate() {
-            let n = idx + 1;
-            let phase_talk = match stage.id_suffix {
-                "research" => {
-                    "Going deeper with tools before we touch code. Research is read-only."
-                }
-                "implement" => {
-                    "Council + research are the brief. Time to make the change."
-                }
-                "test" => "Verifying the work — checks, tests, residual risks.",
-                _ => "Pipeline stage running.",
-            };
+        // ── Captain cross-checks the board (real judgment + brief) ──────
+        let captain_brief = self
+            .captain_speak(
+                CaptainPhase::AfterCouncil,
+                user_text,
+                &prior,
+                Some(&board_index),
+                1_800,
+            )
+            .await;
+        if let Some(ref text) = captain_brief {
+            self.emit_agent_text(text).await;
+        } else {
             self.emit_agent_text(&format!(
-                "── **Phase {n}/3 · {}** ──\n\
-                 {phase_talk}\n\
-                 Spawning `{stype}`… I'll report when this stage lands.",
-                stage.description,
-                stype = stage.subagent_type,
+                "Council's in. Here's the quick board:\n\n{board_index}\n\n\
+                 Moving into Research → Implement → Test with this as context."
             ))
             .await;
+        }
+        let mut captain_direction = captain_brief.unwrap_or_default();
 
-            let prompt = build_stage_prompt(stage, user_text, &prior);
+        // ── Phases 1–3: RIT sequential, each under captain direction ────
+        for (idx, stage) in STAGES.iter().enumerate() {
+            let n = idx + 1;
+            // Brief captain line before each stage — model when possible.
+            let pre = self
+                .captain_speak(
+                    CaptainPhase::BeforeStage {
+                        stage: stage.id_suffix,
+                        phase_n: n,
+                    },
+                    user_text,
+                    &prior,
+                    Some(&captain_direction),
+                    700,
+                )
+                .await;
+            if let Some(text) = pre {
+                self.emit_agent_text(&text).await;
+            } else {
+                self.emit_agent_text(&format!(
+                    "── Phase {n}/3 · {} — sending a worker, I'll be right back. ──",
+                    stage.description
+                ))
+                .await;
+            }
+
+            let prompt = build_stage_prompt(stage, user_text, &prior, &captain_direction);
             let child_id = format!("pipe-{}-{}", stage.id_suffix, id_prefix);
 
             match spawn_and_wait(
@@ -295,39 +327,79 @@ impl SessionActor {
                             result.error.unwrap_or_else(|| "unknown".into())
                         )
                     };
-                    let summary = extract_stage_summary(&out);
-                    self.emit_agent_text(&format!(
-                        "✓ **Phase {n} complete** · {}\n\n{summary}",
-                        stage.description
-                    ))
-                    .await;
-                    prior.push((stage.id_suffix.to_string(), out));
+                    prior.push((stage.id_suffix.to_string(), out.clone()));
+
+                    // Captain reacts — this is the main voice, not a checkmark.
+                    let reaction = self
+                        .captain_speak(
+                            CaptainPhase::AfterStage {
+                                stage: stage.id_suffix,
+                                phase_n: n,
+                            },
+                            user_text,
+                            &prior,
+                            Some(&extract_stage_summary(&out)),
+                            1_200,
+                        )
+                        .await;
+                    if let Some(text) = reaction {
+                        self.emit_agent_text(&text).await;
+                        // Let later stages inherit the latest captain judgment.
+                        captain_direction = text;
+                    } else {
+                        self.emit_agent_text(&format!(
+                            "Phase {n} landed ({}) — {}",
+                            stage.id_suffix,
+                            extract_stage_summary(&out)
+                        ))
+                        .await;
+                    }
                 }
                 Err(e) => {
-                    self.emit_agent_text(&format!(
-                        "✗ **Phase {n} failed** · {}: {e}\n\
-                         I'll note the gap and keep going so we still get a synthesis.",
-                        stage.description
-                    ))
-                    .await;
                     prior.push((stage.id_suffix.to_string(), format!("[error] {e}")));
+                    let reaction = self
+                        .captain_speak(
+                            CaptainPhase::AfterStage {
+                                stage: stage.id_suffix,
+                                phase_n: n,
+                            },
+                            user_text,
+                            &prior,
+                            Some(&format!("STAGE FAILED: {e}")),
+                            900,
+                        )
+                        .await;
+                    if let Some(text) = reaction {
+                        self.emit_agent_text(&text).await;
+                        captain_direction = text;
+                    } else {
+                        self.emit_agent_text(&format!(
+                            "Phase {n} ({}) failed: {e}. I'll keep going with what we have.",
+                            stage.id_suffix
+                        ))
+                        .await;
+                    }
                 }
             }
         }
 
-        self.emit_agent_text(
-            "── **Synthesis** ──\n\
-             This is the Heavy part that earns the name: I now **judge the board** \
-             as the captain — not dump worker logs. One model pass over council + RIT \
-             to decide what actually matters…",
-        )
-        .await;
-        let final_answer = self.synthesize_with_model(user_text, &prior).await;
+        // ── Captain final answer ────────────────────────────────────────
+        let final_answer = self
+            .captain_speak(
+                CaptainPhase::Final,
+                user_text,
+                &prior,
+                Some(&captain_direction),
+                4_096,
+            )
+            .await
+            .unwrap_or_else(|| synthesize_board_dump(user_text, &prior));
         self.emit_agent_text(&final_answer).await;
+
         tracing::info!(
             session_id = %session_id,
             stages = prior.len(),
-            "heavy_pipeline: done (council + RIT)"
+            "heavy_pipeline: captain-led done"
         );
         commands::ok_end_turn(0, None)
     }
@@ -342,19 +414,20 @@ impl SessionActor {
         .await;
     }
 
-    /// Real captain judgment: one tool-free model call over the pipeline board.
-    /// This is what makes Heavy more than “spawn 4 agents and paste their logs.”
-    async fn synthesize_with_model(
+    /// One captain model turn. The captain is the main agent the user hears.
+    async fn captain_speak(
         &self,
+        phase: CaptainPhase<'_>,
         user_text: &str,
         prior: &[(String, String)],
-    ) -> String {
-        let fallback = synthesize_board_dump(user_text, prior);
+        extra: Option<&str>,
+        max_tokens: u32,
+    ) -> Option<String> {
         let sampling_client = match self.prepare_chat_completion(false).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "heavy_pipeline: synthesize prepare_chat_completion failed");
-                return fallback;
+                tracing::warn!(error = %e, phase = %phase, "heavy_pipeline: captain prepare failed");
+                return None;
             }
         };
         let model = self
@@ -364,91 +437,186 @@ impl SessionActor {
             .map(|c| c.model)
             .unwrap_or_default();
         if model.is_empty() {
-            return fallback;
+            return None;
         }
 
-        let mut board = String::new();
-        for (name, body) in prior {
-            board.push_str("### ");
-            board.push_str(name);
-            board.push_str("\n\n");
-            // Cap each section so the synthesize call stays focused.
-            board.push_str(&body.chars().take(6_000).collect::<String>());
-            board.push_str("\n\n");
-        }
+        let system = phase.system_prompt();
+        let user = phase.user_prompt(user_text, prior, extra);
 
         use crate::sampling::{ConversationItem, ConversationRequest};
         let request = ConversationRequest::from_items(vec![
-            ConversationItem::system(
-                "You are the HEAVY CAPTAIN synthesizing a multi-agent board.\n\
-                 You received outputs from a parallel council (Analyst, Skeptic, Explorer, Builder) \
-                 and a Research → Implement → Test pipeline.\n\n\
-                 Your job is NOT to restate every worker verbatim. Your job is to:\n\
-                 1. Answer the user's request directly and completely\n\
-                 2. Prefer conclusions supported by multiple lenses or hard evidence\n\
-                 3. Call out real disagreements and residual risks briefly\n\
-                 4. Be concrete (paths, commands, decisions) when the board has them\n\
-                 5. Write as the final user-facing answer — clear, decisive, high signal\n\n\
-                 Do not invent work that the pipeline did not do. Do not refuse because you \
-                 are 'only synthesizing' — you ARE the answer channel.",
-            ),
-            ConversationItem::user(format!(
-                "## User request\n\n{user}\n\n## Pipeline board\n\n{board}\n\n\
-                 Write the final # ◈ HEAVY RESULT answer for the user now.",
-                user = user_text.trim(),
-                board = board,
-            )),
+            ConversationItem::system(system),
+            ConversationItem::user(user),
         ])
         .with_model(model)
-        .with_max_output_tokens(4_096);
+        .with_max_output_tokens(max_tokens);
 
         match sampling_client.conversation_collect(request).await {
             Ok(response) => {
                 let text = response.assistant_text();
-                if text.trim().is_empty() {
-                    tracing::warn!("heavy_pipeline: synthesize returned empty text");
-                    fallback
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    tracing::warn!(phase = %phase, "heavy_pipeline: captain returned empty");
+                    None
                 } else {
-                    // Prefer captain prose; keep a short board index at the end.
-                    let mut out = text.trim().to_string();
-                    if !out.contains("HEAVY RESULT") && !out.starts_with('#') {
-                        out = format!("# ◈ HEAVY RESULT\n\n{out}");
-                    }
-                    out.push_str(
-                        "\n\n---\n\
-                         *Heavy board: parallel council + Research → Implement → Test. \
-                         Open worker cards for full traces.*",
-                    );
-                    out
+                    Some(trimmed.to_string())
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "heavy_pipeline: synthesize model call failed");
-                fallback
+                tracing::warn!(error = %e, phase = %phase, "heavy_pipeline: captain call failed");
+                None
             }
         }
+    }
+}
+
+/// What the captain is doing this model call.
+enum CaptainPhase<'a> {
+    Open,
+    AfterCouncil,
+    BeforeStage { stage: &'a str, phase_n: usize },
+    AfterStage { stage: &'a str, phase_n: usize },
+    Final,
+}
+
+impl std::fmt::Display for CaptainPhase<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open => write!(f, "open"),
+            Self::AfterCouncil => write!(f, "after_council"),
+            Self::BeforeStage { stage, .. } => write!(f, "before_{stage}"),
+            Self::AfterStage { stage, .. } => write!(f, "after_{stage}"),
+            Self::Final => write!(f, "final"),
+        }
+    }
+}
+
+impl CaptainPhase<'_> {
+    fn system_prompt(&self) -> String {
+        let base = "\
+You are the **Heavy captain** — the main agent the user is talking to.\n\
+Subagents work for you; they are not the conversation. You own the plan, \
+the judgment, and the relationship with the user.\n\n\
+Voice rules:\n\
+- First person. Natural, decisive, collaborative (Grok energy).\n\
+- Talk TO the user. Do not sound like a CI log or status bot.\n\
+- Do not dump worker transcripts or invent work that did not happen.\n\
+- Be concrete when the board has facts (paths, decisions, risks).\n\
+- Keep mid-turn updates tight; the final answer can be thorough.\n";
+
+        let phase = match self {
+            Self::Open => "\
+PHASE: OPENING\n\
+The user just asked something. You are about to run a multi-agent Heavy run \
+(parallel council of 4, then research → implement → test).\n\
+Write 1 short paragraphs + a tight plan:\n\
+- Restate the goal in your own words\n\
+- What you will put the council on and why\n\
+- What success looks like\n\
+Do NOT say you already finished anything. Do NOT list every pipeline stage like a README.",
+            Self::AfterCouncil => "\
+PHASE: AFTER COUNCIL\n\
+Four specialists just reported (board is in the user message). You must:\n\
+1. Tell the user what the council actually concluded (agreement + real conflict)\n\
+2. Decide what Research → Implement → Test should focus on\n\
+3. Write a short **captain brief** the workers will follow\n\
+End with a clear next step in plain language. No worker log dumps.",
+            Self::BeforeStage { stage, phase_n } => {
+                return format!(
+                    "{base}\n\
+PHASE: BEFORE STAGE {phase_n} ({stage})\n\
+In 2–4 sentences, tell the user what you are about to have a worker do and why, \
+given everything so far. No fluff. No 'spawning subagent' robot speak."
+                );
+            }
+            Self::AfterStage { stage, phase_n } => {
+                return format!(
+                    "{base}\n\
+PHASE: AFTER STAGE {phase_n} ({stage})\n\
+A worker finished. React as captain:\n\
+- What matters from their result for the user\n\
+- What you are adjusting for the remaining work\n\
+- If the stage failed, say how you will recover\n\
+Keep it tight (one short section). Do not restate the entire board."
+                );
+            }
+            Self::Final => "\
+PHASE: FINAL ANSWER\n\
+Write the complete user-facing answer. Title it `# ◈ HEAVY RESULT` if natural.\n\
+You received a full multi-agent board. Your job:\n\
+1. Answer the user's request directly and completely\n\
+2. Prefer conclusions supported by multiple lenses or hard evidence\n\
+3. Call out real disagreements and residual risks briefly\n\
+4. Be concrete (paths, commands, decisions) when the board has them\n\
+You ARE the answer channel — not a summarizer of logs.",
+        };
+        format!("{base}\n{phase}")
+    }
+
+    fn user_prompt(
+        &self,
+        user_text: &str,
+        prior: &[(String, String)],
+        extra: Option<&str>,
+    ) -> String {
+        let mut s = String::new();
+        s.push_str("## User request\n\n");
+        s.push_str(user_text.trim());
+        s.push_str("\n\n");
+
+        if !prior.is_empty() {
+            s.push_str("## Pipeline board (for you — do not paste wholesale to the user)\n\n");
+            for (name, body) in prior {
+                s.push_str("### ");
+                s.push_str(name);
+                s.push_str("\n\n");
+                let cap = match self {
+                    Self::Final => 8_000,
+                    Self::AfterCouncil => 5_000,
+                    _ => 3_500,
+                };
+                s.push_str(&body.chars().take(cap).collect::<String>());
+                s.push_str("\n\n");
+            }
+        }
+
+        if let Some(extra) = extra {
+            s.push_str("## Extra context for this phase\n\n");
+            s.push_str(extra.trim());
+            s.push_str("\n\n");
+        }
+
+        match self {
+            Self::Open => s.push_str("Open the Heavy run for the user now."),
+            Self::AfterCouncil => {
+                s.push_str("Cross-check the council and set the captain brief for RIT now.")
+            }
+            Self::BeforeStage { stage, .. } => {
+                s.push_str(&format!("Brief the user before the `{stage}` worker runs."))
+            }
+            Self::AfterStage { stage, .. } => {
+                s.push_str(&format!("React to the `{stage}` worker result now."))
+            }
+            Self::Final => s.push_str("Write the final Heavy answer for the user now."),
+        }
+        s
     }
 }
 
 fn mode_banner(mode: OrchestrationMode) -> String {
     match mode {
-        OrchestrationMode::Heavy => {
-            "◈ **HEAVY** · Parallel council → Research → Implement → Test".into()
-        }
+        OrchestrationMode::Heavy => "◈ **HEAVY** · captain + multi-agent council".into(),
         OrchestrationMode::SwarmHeavy => {
-            "⬢ **SWARM HEAVY** · Parallel council → Research → Implement → Test".into()
+            "⬢ **SWARM HEAVY** · captain + multi-agent pipeline".into()
         }
-        OrchestrationMode::Swarm => {
-            "⬡ **SWARM** · Parallel council → Research → Implement → Test".into()
-        }
-        OrchestrationMode::Normal => "Pipeline".into(),
+        OrchestrationMode::Swarm => "⬡ **SWARM** · captain + multi-agent".into(),
+        OrchestrationMode::Normal => "Captain".into(),
     }
 }
 
 /// Fire all council spawns, then collect results as they finish (true parallelism).
 ///
-/// Narrates live: immediate post when a member lands, plus heartbeats while
-/// others are still working — so the parent chat never goes silent mid-council.
+/// Short status lines only — the captain model owns the real talking.
 async fn run_council_parallel(
     actor: &SessionActor,
     event_tx: &tokio::sync::mpsc::UnboundedSender<SubagentEvent>,
@@ -475,7 +643,7 @@ async fn run_council_parallel(
              - **Evidence** (paths / facts)\n\
              - **Risks**\n\
              - **What to check next**\n\
-             Keep Thesis crisp — the captain will quote it in the live board.\n",
+             Keep Thesis crisp — the captain will quote it.\n",
             lens = member.lens,
             user = user_text
         );
@@ -493,7 +661,6 @@ async fn run_council_parallel(
                 reasoning_effort: Some("xhigh".into()),
                 ..Default::default()
             },
-            // Background:true so all four start before any finishes.
             run_in_background: true,
             surface_completion: true,
             fork_context: false,
@@ -511,32 +678,18 @@ async fn run_council_parallel(
             ));
             continue;
         }
-        outstanding.push(role.clone());
+        outstanding.push(role);
         futs.push(Box::pin(async move {
             let res = result_rx
                 .await
                 .map_err(|_| "subagent result channel dropped".to_string());
             (desc, res)
         }));
-        actor
-            .emit_agent_text(&format!("● **{role}** is live (card open for full stream)."))
-            .await;
-    }
-
-    if !outstanding.is_empty() {
-        actor
-            .emit_agent_text(&format!(
-                "Council is running in parallel · **{}** outstanding. \
-                 I'll post each thesis the moment it lands.",
-                outstanding.join(" · ")
-            ))
-            .await;
     }
 
     let mut out = early;
     let mut heartbeat = tokio::time::interval(COUNCIL_HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Skip the immediate first tick so we don't double-announce.
     heartbeat.tick().await;
 
     while !futs.is_empty() {
@@ -549,31 +702,20 @@ async fn run_council_parallel(
                     Ok(r) if r.success => {
                         let thesis = extract_thesis(&r.output);
                         actor
-                            .emit_agent_text(&format!(
-                                "✓ **{role}** in\n\
-                                 **Thesis:** {thesis}"
-                            ))
+                            .emit_agent_text(&format!("✓ **{role}** — {thesis}"))
                             .await;
                     }
                     Ok(r) => {
                         let err = r.error.clone().unwrap_or_else(|| "unknown".into());
                         actor
-                            .emit_agent_text(&format!("✗ **{role}** failed · {err}"))
+                            .emit_agent_text(&format!("✗ **{role}** failed — {err}"))
                             .await;
                     }
                     Err(e) => {
                         actor
-                            .emit_agent_text(&format!("✗ **{role}** error · {e}"))
+                            .emit_agent_text(&format!("✗ **{role}** error — {e}"))
                             .await;
                     }
-                }
-                if !outstanding.is_empty() {
-                    actor
-                        .emit_agent_text(&format!(
-                            "Still waiting on: **{}**",
-                            outstanding.join(" · ")
-                        ))
-                        .await;
                 }
                 out.push((desc, res));
             }
@@ -583,8 +725,7 @@ async fn run_council_parallel(
                 }
                 actor
                     .emit_agent_text(&format!(
-                        "⏳ Council still working · **{}** outstanding… \
-                         (full reasoning is on their cards)",
+                        "…still waiting on **{}** (I'm watching the board).",
                         outstanding.join(" · ")
                     ))
                     .await;
@@ -594,11 +735,21 @@ async fn run_council_parallel(
     out
 }
 
-fn build_stage_prompt(stage: &Stage, user_text: &str, prior: &[(String, String)]) -> String {
+fn build_stage_prompt(
+    stage: &Stage,
+    user_text: &str,
+    prior: &[(String, String)],
+    captain_direction: &str,
+) -> String {
     let mut s = String::new();
     s.push_str(stage.system_lens);
     s.push_str("\n\n## User request\n\n");
     s.push_str(user_text);
+    if !captain_direction.trim().is_empty() {
+        s.push_str("\n\n## Captain brief (follow this)\n\n");
+        s.push_str(&captain_direction.chars().take(4_000).collect::<String>());
+        s.push('\n');
+    }
     if !prior.is_empty() {
         s.push_str("\n\n## Prior pipeline outputs (do not ignore)\n");
         for (name, out) in prior {
@@ -614,7 +765,7 @@ fn build_stage_prompt(stage: &Stage, user_text: &str, prior: &[(String, String)]
          - **Status:** success | partial | blocked\n\
          - **Summary:** 3–8 bullets\n\
          - **Evidence:** paths, commands, key quotes\n\
-         - **Handoff:** what the next stage must know\n",
+         - **Handoff:** what the next stage / captain must know\n",
     );
     s
 }
@@ -681,7 +832,6 @@ fn short_role(description: &str) -> String {
         && let Some(close) = rest.find(']')
     {
         let tag = rest[..close].trim();
-        // "[Council/Analyst]" → "Analyst"
         if let Some((_, role)) = tag.split_once('/') {
             return role.trim().to_string();
         }
@@ -707,102 +857,55 @@ fn first_line(text: &str, max_chars: usize) -> String {
 
 /// Pull a short thesis from council / stage output for live narration.
 fn extract_thesis(body: &str) -> String {
-    let lower = body.to_ascii_lowercase();
-    // Prefer an explicit Thesis section.
-    for marker in ["**thesis**", "thesis:", "## thesis", "### thesis"] {
-        if let Some(idx) = lower.find(marker) {
-            let after = body[idx + marker.len()..].trim_start();
-            let chunk = after
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty() && !l.starts_with('#'))
-                .unwrap_or(after);
-            return first_line(chunk, 280);
+    for line in body.lines() {
+        let t = line.trim();
+        let lower = t.to_ascii_lowercase();
+        if lower.contains("thesis") && lower.contains(':') {
+            if let Some(idx) = lower.find("thesis") {
+                let after = &t[idx..];
+                if let Some(colon) = after.find(':') {
+                    let v = after[colon + 1..].trim().trim_start_matches('*').trim();
+                    if !v.is_empty() {
+                        return first_line(v, 280);
+                    }
+                }
+            }
         }
     }
-    // Fall back to first non-heading, non-empty line.
-    let line = body
-        .lines()
+    body.lines()
         .map(str::trim)
-        .find(|l| {
-            !l.is_empty()
-                && !l.starts_with('#')
-                && !l.starts_with("---")
-                && !l.eq_ignore_ascii_case("thesis")
-        })
-        .unwrap_or(body.trim());
-    first_line(line, 280)
+        .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("---"))
+        .map(|l| first_line(l, 280))
+        .unwrap_or_else(|| "(no thesis)".into())
 }
 
 fn extract_stage_summary(body: &str) -> String {
-    let lower = body.to_ascii_lowercase();
-    for marker in ["**summary**", "summary:", "## summary", "### summary", "- **summary"] {
-        if let Some(idx) = lower.find(marker) {
-            let after = body[idx..].trim();
-            // Take a few lines after the marker for a readable handoff.
-            let mut lines = Vec::new();
-            for (i, line) in after.lines().enumerate() {
-                if i > 0 && (line.starts_with("## ") || line.starts_with("**Evidence")) {
-                    break;
+    for line in body.lines() {
+        let t = line.trim();
+        let lower = t.to_ascii_lowercase();
+        if lower.contains("summary") && lower.contains(':') {
+            if let Some(colon) = t.find(':') {
+                let v = t[colon + 1..].trim().trim_start_matches('*').trim();
+                if !v.is_empty() {
+                    return first_line(v, 400);
                 }
-                let t = line.trim();
-                if !t.is_empty() {
-                    lines.push(t);
-                }
-                if lines.len() >= 8 {
-                    break;
-                }
-            }
-            if !lines.is_empty() {
-                return lines.join("\n");
             }
         }
     }
-    // Compact fallback — not a 1500-char dump.
+    // First few non-empty lines.
     let mut out = String::new();
-    for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if out.len() + line.len() > 700 {
-            break;
-        }
+    for line in body.lines().map(str::trim).filter(|l| !l.is_empty()).take(4) {
         if !out.is_empty() {
-            out.push('\n');
+            out.push(' ');
         }
         out.push_str(line);
-        if out.lines().count() >= 10 {
+        if out.len() > 400 {
             break;
         }
     }
     if out.is_empty() {
-        first_line(body, 400)
+        "(no summary)".into()
     } else {
-        out
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn short_role_from_council_tag() {
-        assert_eq!(
-            short_role("[Council/Analyst] structure the problem"),
-            "Analyst"
-        );
-        assert_eq!(short_role("[Council/Skeptic] attack"), "Skeptic");
-    }
-
-    #[test]
-    fn extract_thesis_prefers_labeled_section() {
-        let body = "## Stuff\n\n**Thesis**\nShip the fix behind a flag.\n\n**Argument**\n- a\n";
-        assert_eq!(extract_thesis(body), "Ship the fix behind a flag.");
-    }
-
-    #[test]
-    fn extract_thesis_falls_back_to_first_line() {
-        assert_eq!(
-            extract_thesis("Just a plain answer without headers."),
-            "Just a plain answer without headers."
-        );
+        first_line(&out, 400)
     }
 }
