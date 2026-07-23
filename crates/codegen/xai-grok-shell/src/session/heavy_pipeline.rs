@@ -35,9 +35,9 @@ const MAX_HEARTBEATS: u32 = 3;
 /// How often we sample child speech for live dialogue in the parent chat.
 const DIALOGUE_POLL: Duration = Duration::from_millis(450);
 /// Min new chars before we push a dialogue delta (avoids per-token spam).
-const DIALOGUE_MIN_DELTA: usize = 48;
+const DIALOGUE_MIN_DELTA: usize = 24;
 /// Max chars of a single dialogue push (keep the feed readable).
-const DIALOGUE_MAX_CHUNK: usize = 420;
+const DIALOGUE_MAX_CHUNK: usize = 360;
 
 // ── Council (Heavy / Swarm Heavy) ───────────────────────────────────────────
 
@@ -1179,16 +1179,27 @@ fn read_child_spoken_text(dir: &std::path::Path) -> String {
     out
 }
 
-/// Emit new speech with speaker headers on switch:
+/// Format one spoken chunk. Always labels the speaker so the feed reads like:
 /// ```text
-/// **◈ Analyst**
-/// I think the bug is…
+/// ▸ Analyst: I think the bug is in add.py…
 ///
-/// **◈ Skeptic**
-/// Disagree — …
+/// ▸ Skeptic: Disagree — verify before claiming PASS…
 /// ```
+fn format_speaker_chunk(label: &str, text: &str, switched: bool) -> String {
+    let body = text.trim();
+    if body.is_empty() {
+        return String::new();
+    }
+    if switched {
+        format!("▸ **{label}:** {body}\n")
+    } else {
+        // Continuation from same agent — indent under the turn.
+        format!("  {body}\n")
+    }
+}
+
+/// Emit new speech; re-label whenever the speaker changes.
 async fn emit_dialogue_deltas(actor: &SessionActor, state: &mut DialogueState) {
-    // Round-robin sample so we don't always favor the same speaker.
     for (child_id, label) in state.speakers.clone() {
         let Some(dir) = state.child_dir(&child_id) else {
             continue;
@@ -1202,7 +1213,6 @@ async fn emit_dialogue_deltas(actor: &SessionActor, state: &mut DialogueState) {
             continue;
         }
         let mut delta = full[already..].to_string();
-        // Prefer emitting at a sentence boundary when the delta is large.
         if delta.len() > DIALOGUE_MAX_CHUNK {
             let cut = delta
                 .char_indices()
@@ -1213,7 +1223,6 @@ async fn emit_dialogue_deltas(actor: &SessionActor, state: &mut DialogueState) {
                 .unwrap_or(DIALOGUE_MAX_CHUNK);
             delta = delta.chars().take(cut).collect();
         }
-        // Hold tiny fragments unless speaker is finishing a thought later.
         if delta.chars().count() < DIALOGUE_MIN_DELTA
             && !delta.contains('\n')
             && !delta.ends_with('.')
@@ -1227,15 +1236,12 @@ async fn emit_dialogue_deltas(actor: &SessionActor, state: &mut DialogueState) {
         }
 
         let switch = state.current_speaker.as_deref() != Some(label.as_str());
-        let mut piece = String::new();
-        if switch {
-            // Grok Heavy-style turn switch: clear speaker label, then speech.
-            piece.push_str(&format!("**{label}:**\n"));
-            state.current_speaker = Some(label.clone());
+        let piece = format_speaker_chunk(&label, &delta, switch);
+        if piece.is_empty() {
+            continue;
         }
-        piece.push_str(delta.trim_end());
-        if !piece.ends_with('\n') {
-            piece.push('\n');
+        if switch {
+            state.current_speaker = Some(label.clone());
         }
         actor.emit_agent_text(&piece).await;
         let new_len = already + delta.len();
@@ -1620,13 +1626,13 @@ async fn force_flush_dialogue(actor: &SessionActor, state: &mut DialogueState) {
             continue;
         }
         let switch = state.current_speaker.as_deref() != Some(label.as_str());
-        let mut piece = String::new();
+        let piece = format_speaker_chunk(&label, delta, switch);
+        if piece.is_empty() {
+            continue;
+        }
         if switch {
-            piece.push_str(&format!("**{label}:**\n"));
             state.current_speaker = Some(label.clone());
         }
-        piece.push_str(delta);
-        piece.push('\n');
         actor.emit_agent_text(&piece).await;
         state.emitted_len.insert(label, full.len());
     }
