@@ -1241,9 +1241,9 @@ async fn activate_verified_download(download: &VerifiedDownload) -> Result<()> {
 
     eprintln!();
 
-    // Clean up old versioned binaries (keeps current + 1 previous).
-    cleanup_old_downloads(&download_dir, "grok", &download.version).await;
-    cleanup_old_downloads(&download_dir, "grok-pager", &download.version).await;
+    // Clean up old versioned binaries (keeps current + 1 previous for rollback).
+    cleanup_old_downloads(&download_dir, "grok", &download.version, 1).await;
+    cleanup_old_downloads(&download_dir, "grok-pager", &download.version, 1).await;
 
     // Persist installer to config.toml so future runs auto-detect internal.
     let _ = config::update_config(|st| {
@@ -1743,21 +1743,27 @@ async fn sweep_old_exe_backups(old: &std::path::Path) {
 
 /// Best-effort cleanup of old versioned binaries for a given binary name.
 ///
-/// Mirrors the npm `cleanupOldVersions()` policy: keeps the current version
-/// plus one previous version (in case a process is still running the old binary
-/// and hasn't fully loaded all pages yet — deleting it on macOS causes SIGKILL
-/// because the kernel can no longer verify the code signature).
+/// Keeps the **current** version and up to `keep_previous` older versions
+/// (sorted by semver, newest first). Stock `grok` uses `keep_previous = 1`
+/// (rollback / macOS code-signature safety for a still-running old process).
+/// This fork's `grok-swarm` uses `keep_previous = 0` so reinstalls do not
+/// pile up ~150MB copies over time.
 ///
-/// `bin_prefix` is the binary name prefix, e.g. `"grok"` or `"grok-pager"`.
-/// Files must match `{bin_prefix}-{digit}*` to be considered versioned binaries
-/// (this avoids `grok-*` matching `grok-pager-*` or `grok-latest`).
+/// `bin_prefix` is the binary name prefix, e.g. `"grok"`, `"grok-pager"`, or
+/// `"grok-swarm"`. Files must match `{bin_prefix}-{digit}*` to be considered
+/// versioned binaries (this avoids `grok-*` matching `grok-pager-*`).
 ///
 /// Temporary/partial files (containing `.tmp`) are deleted only once they
 /// are **stale** (mtime older than [`STALE_TMP_AGE`]). A fresh `.tmp` may be
 /// a concurrent updater's in-flight download — the same-instant race the
 /// lock-free design accepts — and deleting it out from under that updater
 /// would make its atomic rename fail.
-async fn cleanup_old_downloads(dir: &std::path::Path, bin_prefix: &str, current_version: &str) {
+async fn cleanup_old_downloads(
+    dir: &std::path::Path,
+    bin_prefix: &str,
+    current_version: &str,
+    keep_previous: usize,
+) {
     let prefix = format!("{}-", bin_prefix);
     let current_semver = match semver::Version::parse(current_version) {
         Ok(v) => v,
@@ -1836,12 +1842,12 @@ async fn cleanup_old_downloads(dir: &std::path::Path, bin_prefix: &str, current_
         }
     }
 
-    // Sort descending by version so the newest is first.
+    // Sort descending by version so the newest old release is first.
     versioned.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // Keep the most recent old version (index 0), delete the rest (index 1+).
-    // This matches the npm policy: current + 1 previous.
-    for (_, name) in versioned.iter().skip(1) {
+    // Keep the first `keep_previous` old versions; delete the rest.
+    // `keep_previous = 0` → only the current binary remains on disk.
+    for (_, name) in versioned.iter().skip(keep_previous) {
         let path = dir.join(name);
         // Same freshness guard as the `.tmp` sweep: a versioned binary
         // written moments ago is likely a concurrent installer's
@@ -1857,6 +1863,7 @@ async fn cleanup_old_downloads(dir: &std::path::Path, bin_prefix: &str, current_
         if fresh {
             continue;
         }
+        tracing::info!("removing old download {}", name);
         if let Err(e) = tokio::fs::remove_file(&path).await {
             tracing::warn!("failed to remove old binary {}: {}", name, e);
         }
@@ -2071,21 +2078,21 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
         windows_replace_exe(&binary_path, &bin_link).await?;
     }
 
-    // Convenience copy into ~/.local/bin when that directory exists.
+    // Symlink into ~/.local/bin when present — never a second full ~150MB copy.
     #[cfg(unix)]
     if let Some(home) = dirs_next_home() {
-        use std::os::unix::fs::PermissionsExt;
         let local_bin = home.join(".local/bin");
         if local_bin.is_dir() {
             let dest = local_bin.join(prefix);
-            if let Err(e) = tokio::fs::copy(&binary_path, &dest).await {
-                tracing::debug!(error = %e, "optional ~/.local/bin copy skipped");
-            } else {
-                let _ = tokio::fs::set_permissions(
-                    &dest,
-                    std::fs::Permissions::from_mode(0o755),
-                )
-                .await;
+            // Remove a leftover full-copy install from older installers.
+            if dest.exists() && !dest.is_symlink() {
+                let _ = tokio::fs::remove_file(&dest).await;
+            }
+            if let Err(e) = atomic_symlink_swap(&bin_link, &dest).await {
+                // Fall back to relative/absolute link if atomic helper fails.
+                tracing::debug!(error = %e, "optional ~/.local/bin symlink skipped");
+                let _ = tokio::fs::remove_file(&dest).await;
+                let _ = tokio::fs::symlink(&bin_link, &dest).await;
             }
         }
     }
@@ -2093,7 +2100,8 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
     eprintln!("  Installed {prefix} v{version} → {}", bin_link.display());
     eprintln!();
 
-    cleanup_old_downloads(&download_dir, prefix, &version).await;
+    // grok-swarm is ~150MB: keep only the active version (no N-1 pile-up).
+    cleanup_old_downloads(&download_dir, prefix, &version, 0).await;
 
     // Persist installer so future auto-update uses this path.
     let _ = config::update_config(|st| {
@@ -3178,7 +3186,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.145").await;
+        cleanup_old_downloads(d, "grok", "0.1.145", 1).await;
 
         // Current must survive.
         assert!(d.join("grok-0.1.145-macos-aarch64").exists(), "current");
@@ -3204,6 +3212,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cleanup_old_downloads_keep_previous_zero_deletes_all_olds() {
+        // grok-swarm policy: only the active version stays on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        for v in ["0.2.105", "0.2.106", "0.2.107"] {
+            std::fs::write(
+                d.join(format!("grok-swarm-{}-macos-aarch64", v)),
+                v,
+            )
+            .unwrap();
+        }
+        make_all_stale(d);
+
+        cleanup_old_downloads(d, "grok-swarm", "0.2.107", 0).await;
+
+        assert!(
+            d.join("grok-swarm-0.2.107-macos-aarch64").exists(),
+            "current must survive"
+        );
+        assert!(
+            !d.join("grok-swarm-0.2.106-macos-aarch64").exists(),
+            "N-1 should be deleted when keep_previous=0"
+        );
+        assert!(
+            !d.join("grok-swarm-0.2.105-macos-aarch64").exists(),
+            "older should be deleted"
+        );
+    }
+
+    #[tokio::test]
     async fn test_cleanup_old_downloads_does_not_touch_other_binaries() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
@@ -3217,7 +3256,7 @@ mod tests {
         // Cleanup only grok — pager files must be untouched.
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(d.join("grok-0.1.141-macos-aarch64").exists());
         assert!(d.join("grok-0.1.140-macos-aarch64").exists()); // only old, kept as N-1
@@ -3266,7 +3305,7 @@ mod tests {
         std::fs::write(d.join("grok-0.1.142-macos-aarch64.77-0.tmp"), "inflight").unwrap();
         std::fs::write(d.join("grok-0.1.141-macos-aarch64"), "current").unwrap();
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(
             !d.join("grok-0.1.140-macos-aarch64.tmp").exists(),
@@ -3301,7 +3340,7 @@ mod tests {
         // download into place (e.g. a rollback install racing an upgrade).
         std::fs::write(d.join("grok-0.1.138-macos-aarch64"), "in-flight").unwrap();
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(d.join("grok-0.1.141-macos-aarch64").exists(), "current");
         assert!(d.join("grok-0.1.140-macos-aarch64").exists(), "N-1 kept");
@@ -3328,7 +3367,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(
             d.join("grok-latest").exists(),
@@ -3343,7 +3382,7 @@ mod tests {
         // Should not panic or error on empty directory.
         make_all_stale(dir.path());
 
-        cleanup_old_downloads(dir.path(), "grok", "0.1.141").await;
+        cleanup_old_downloads(dir.path(), "grok", "0.1.141", 1).await;
     }
 
     #[tokio::test]
@@ -3359,7 +3398,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.14").await;
+        cleanup_old_downloads(d, "grok", "0.1.14", 1).await;
 
         // Current must survive.
         assert!(
@@ -3395,7 +3434,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok-pager", "0.1.151").await;
+        cleanup_old_downloads(d, "grok-pager", "0.1.151", 1).await;
 
         assert!(d.join("grok-pager-0.1.151-linux-x64").exists(), "current");
         assert!(d.join("grok-pager-0.1.150-linux-x64").exists(), "N-1 kept");
@@ -3422,7 +3461,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(d.join("grok-0.1.141").exists(), "current");
         assert!(d.join("grok-0.1.140").exists(), "N-1 kept");
@@ -3445,7 +3484,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.150-alpha.1").await;
+        cleanup_old_downloads(d, "grok", "0.1.150-alpha.1", 1).await;
 
         // Current must survive.
         assert!(
@@ -3482,7 +3521,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.150").await;
+        cleanup_old_downloads(d, "grok", "0.1.150", 1).await;
 
         // Current must survive.
         assert!(d.join("grok-0.1.150-macos-aarch64").exists(), "current");
@@ -4047,7 +4086,7 @@ mod tests {
         // Invalid version string → cleanup must early-return without deleting.
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "not-a-version").await;
+        cleanup_old_downloads(d, "grok", "not-a-version", 1).await;
         assert!(d.join("grok-0.1.140-macos-aarch64").exists());
         assert!(d.join("grok-0.1.141-macos-aarch64").exists());
     }
@@ -4057,7 +4096,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         // Must not panic when the directory doesn't exist.
-        cleanup_old_downloads(&missing, "grok", "0.1.141").await;
+        cleanup_old_downloads(&missing, "grok", "0.1.141", 1).await;
     }
 
     #[tokio::test]
@@ -4073,7 +4112,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         // grok-latest and grok-pager-* must be untouched.
         assert!(d.join("grok-latest").exists());
@@ -4091,7 +4130,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(
             d.join("grok-9garbage-macos-aarch64").exists(),
@@ -4108,7 +4147,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(d.join("grok-0.1.141-macos-aarch64").exists());
     }
@@ -4122,7 +4161,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         // Only one old version → keep it as N-1.
         assert!(d.join("grok-0.1.140-macos-aarch64").exists(), "N-1 kept");
@@ -4142,7 +4181,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(d.join("README.md").exists());
         assert!(d.join("config.toml").exists());
@@ -4162,7 +4201,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         // Both platform variants of current must survive.
         assert!(d.join("grok-0.1.141-macos-aarch64").exists());
@@ -4185,7 +4224,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(!d.join("grok-junk.tmp").exists(), "junk tmp deleted");
         assert!(
@@ -4207,7 +4246,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(d.join("grok-0.1.141-macos-aarch64").exists(), "current");
         assert!(d.join("grok-0.1.140-macos-aarch64").exists(), "N-1 only");
@@ -4226,7 +4265,7 @@ mod tests {
 
         make_all_stale(d);
 
-        cleanup_old_downloads(d, "grok", "0.1.141").await;
+        cleanup_old_downloads(d, "grok", "0.1.141", 1).await;
 
         assert!(d.join("grok-0.1.141-darwin-arm64").exists(), "current");
         assert!(d.join("grok-0.1.140-darwin-arm64").exists(), "N-1");

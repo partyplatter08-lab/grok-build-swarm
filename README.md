@@ -44,6 +44,10 @@ grok-swarm update
 curl -fsSL https://raw.githubusercontent.com/partyplatter08-lab/grok-build-swarm/main/install.sh | bash
 ```
 
+Only **one** `grok-swarm` binary is kept on disk (`~/.grok/downloads/…`).
+Older versions are deleted after a successful install/update so 20 upgrades
+do not leave 20 × ~150MB copies behind. PATH entries are symlinks, not copies.
+
 ---
 
 ## Quick start
