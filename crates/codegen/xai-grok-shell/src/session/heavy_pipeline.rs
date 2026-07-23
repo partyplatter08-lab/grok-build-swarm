@@ -32,6 +32,12 @@ use crate::session::commands::{self, PromptTurnResult};
 const BOARD_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Hard cap so a hung worker never floods the parent feed.
 const MAX_HEARTBEATS: u32 = 3;
+/// How often we sample child speech for live dialogue in the parent chat.
+const DIALOGUE_POLL: Duration = Duration::from_millis(450);
+/// Min new chars before we push a dialogue delta (avoids per-token spam).
+const DIALOGUE_MIN_DELTA: usize = 48;
+/// Max chars of a single dialogue push (keep the feed readable).
+const DIALOGUE_MAX_CHUNK: usize = 420;
 
 // ── Council (Heavy / Swarm Heavy) ───────────────────────────────────────────
 
@@ -348,6 +354,7 @@ impl SessionActor {
         );
         let impl_id = format!("swarm-impl-{}", id_prefix);
         match spawn_and_wait(
+            self,
             event_tx,
             &impl_id,
             session_id,
@@ -393,6 +400,7 @@ impl SessionActor {
         );
         let test_id = format!("swarm-test-{}", id_prefix);
         match spawn_and_wait(
+            self,
             event_tx,
             &test_id,
             session_id,
@@ -571,6 +579,7 @@ impl SessionActor {
             .await;
         let impl_prompt = build_stage_prompt(&STAGES[1], user_text, &prior, &direction);
         match spawn_and_wait(
+            self,
             event_tx,
             &format!("sh-impl-{}", id_prefix),
             session_id,
@@ -787,6 +796,7 @@ impl SessionActor {
             let child_id = format!("pipe-{}-{}", stage.id_suffix, id_prefix);
 
             match spawn_and_wait(
+                self,
                 event_tx,
                 &child_id,
                 session_id,
@@ -1089,8 +1099,9 @@ impl Cell {
 }
 
 /// Render a compact multi-line board for the TUI (one message, not spam).
+/// Uses `###` so it never collides with live speaker lines (`**Name:**`).
 fn render_board(title: &str, cells: &BTreeMap<String, (Cell, String)>) -> String {
-    let mut s = format!("**{title}**\n");
+    let mut s = format!("### {title}\n");
     for (label, (cell, note)) in cells {
         if note.is_empty() {
             s.push_str(&format!("  {} {}\n", cell.glyph(), label));
@@ -1099,6 +1110,137 @@ fn render_board(title: &str, cells: &BTreeMap<String, (Cell, String)>) -> String
         }
     }
     s
+}
+
+/// Track live speech from each worker so the parent feed can show
+/// `**◈ Analyst**` / `**◈ Skeptic**` turns as they talk (Grok Heavy style).
+struct DialogueState {
+    /// child_session_id (spawn id) → display label
+    speakers: Vec<(String, String)>,
+    /// label → chars already pushed to parent
+    emitted_len: BTreeMap<String, usize>,
+    /// last speaker we emitted for (so we re-header only on switch)
+    current_speaker: Option<String>,
+    /// cached session dirs once found
+    dir_cache: BTreeMap<String, Option<std::path::PathBuf>>,
+}
+
+impl DialogueState {
+    fn new(speakers: Vec<(String, String)>) -> Self {
+        Self {
+            speakers,
+            emitted_len: BTreeMap::new(),
+            current_speaker: None,
+            dir_cache: BTreeMap::new(),
+        }
+    }
+
+    fn child_dir(&mut self, child_id: &str) -> Option<std::path::PathBuf> {
+        if let Some(cached) = self.dir_cache.get(child_id) {
+            return cached.clone();
+        }
+        let found = crate::session::persistence::find_session_dir_by_id(child_id);
+        self.dir_cache.insert(child_id.to_string(), found.clone());
+        found
+    }
+}
+
+/// Pull spoken assistant text so far from a child session (updates.jsonl).
+fn read_child_spoken_text(dir: &std::path::Path) -> String {
+    let path = dir.join("updates.jsonl");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for line in raw.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let update = v
+            .pointer("/params/update")
+            .or_else(|| v.get("update"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let kind = update
+            .get("sessionUpdate")
+            .or_else(|| update.get("session_update"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        if kind != "agent_message_chunk" {
+            continue;
+        }
+        if let Some(t) = update
+            .pointer("/content/text")
+            .and_then(|x| x.as_str())
+        {
+            out.push_str(t);
+        }
+    }
+    out
+}
+
+/// Emit new speech with speaker headers on switch:
+/// ```text
+/// **◈ Analyst**
+/// I think the bug is…
+///
+/// **◈ Skeptic**
+/// Disagree — …
+/// ```
+async fn emit_dialogue_deltas(actor: &SessionActor, state: &mut DialogueState) {
+    // Round-robin sample so we don't always favor the same speaker.
+    for (child_id, label) in state.speakers.clone() {
+        let Some(dir) = state.child_dir(&child_id) else {
+            continue;
+        };
+        let full = read_child_spoken_text(&dir);
+        if full.is_empty() {
+            continue;
+        }
+        let already = state.emitted_len.get(&label).copied().unwrap_or(0);
+        if full.len() <= already {
+            continue;
+        }
+        let mut delta = full[already..].to_string();
+        // Prefer emitting at a sentence boundary when the delta is large.
+        if delta.len() > DIALOGUE_MAX_CHUNK {
+            let cut = delta
+                .char_indices()
+                .take_while(|(i, _)| *i < DIALOGUE_MAX_CHUNK)
+                .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '\n'))
+                .map(|(i, _)| i + 1)
+                .last()
+                .unwrap_or(DIALOGUE_MAX_CHUNK);
+            delta = delta.chars().take(cut).collect();
+        }
+        // Hold tiny fragments unless speaker is finishing a thought later.
+        if delta.chars().count() < DIALOGUE_MIN_DELTA
+            && !delta.contains('\n')
+            && !delta.ends_with('.')
+            && !delta.ends_with('!')
+            && !delta.ends_with('?')
+        {
+            continue;
+        }
+        if delta.trim().is_empty() {
+            continue;
+        }
+
+        let switch = state.current_speaker.as_deref() != Some(label.as_str());
+        let mut piece = String::new();
+        if switch {
+            // Grok Heavy-style turn switch: clear speaker label, then speech.
+            piece.push_str(&format!("**{label}:**\n"));
+            state.current_speaker = Some(label.clone());
+        }
+        piece.push_str(delta.trim_end());
+        if !piece.ends_with('\n') {
+            piece.push('\n');
+        }
+        actor.emit_agent_text(&piece).await;
+        let new_len = already + delta.len();
+        state.emitted_len.insert(label, new_len);
+    }
 }
 
 async fn run_parallel_units(
@@ -1118,13 +1260,22 @@ async fn run_parallel_units(
     > = FuturesUnordered::new();
     let mut cells: BTreeMap<String, (Cell, String)> = BTreeMap::new();
     let mut early: Vec<(String, Result<SubagentResult, String>)> = Vec::new();
+    let mut dialogue_speakers: Vec<(String, String)> = Vec::new();
+
+    actor
+        .emit_agent_text(
+            "── **Live council feed** · agents speak as they work (switches speakers) ──",
+        )
+        .await;
 
     for spec in specs {
         let label = spec.label.clone();
+        let child_id = spec.id.clone();
         cells.insert(label.clone(), (Cell::Running, String::new()));
+        dialogue_speakers.push((child_id.clone(), label.clone()));
         let (result_tx, result_rx) = oneshot::channel();
         let request = SubagentRequest {
-            id: spec.id,
+            id: child_id,
             prompt: spec.prompt,
             description: spec.description,
             subagent_type: spec.subagent_type.to_string(),
@@ -1163,16 +1314,22 @@ async fn run_parallel_units(
         .emit_agent_text(&render_board(board_title, &cells))
         .await;
 
+    let mut dialogue = DialogueState::new(dialogue_speakers);
     let mut out = early;
     let mut heartbeat = tokio::time::interval(BOARD_HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
+    let mut dialogue_tick = tokio::time::interval(DIALOGUE_POLL);
+    dialogue_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    dialogue_tick.tick().await;
     let mut heartbeats: u32 = 0;
 
     while !futs.is_empty() {
         tokio::select! {
             biased;
             Some((label, res)) = futs.next() => {
+                // Flush residual speech (including tiny trailing fragments).
+                force_flush_dialogue(actor, &mut dialogue).await;
                 match &res {
                     Ok(r) if r.success => {
                         let note = extract_thesis(&r.output);
@@ -1186,15 +1343,16 @@ async fn run_parallel_units(
                         cells.insert(label.clone(), (Cell::Fail, first_line(e, 80)));
                     }
                 }
-                // One clean board redraw per landing — looks right in the TUI.
                 actor
                     .emit_agent_text(&render_board(board_title, &cells))
                     .await;
                 out.push((label, res));
             }
+            _ = dialogue_tick.tick(), if !futs.is_empty() => {
+                emit_dialogue_deltas(actor, &mut dialogue).await;
+            }
             _ = heartbeat.tick(), if !futs.is_empty() && heartbeats < MAX_HEARTBEATS => {
                 heartbeats += 1;
-                // Quiet heartbeat: re-post board only (no "still waiting" spam).
                 actor
                     .emit_agent_text(&render_board(
                         &format!("{board_title} · waiting"),
@@ -1365,6 +1523,7 @@ fn build_stage_prompt(
 }
 
 async fn spawn_and_wait(
+    actor: &SessionActor,
     event_tx: &tokio::sync::mpsc::UnboundedSender<SubagentEvent>,
     id: &str,
     parent_session_id: &str,
@@ -1373,6 +1532,34 @@ async fn spawn_and_wait(
     subagent_type: &str,
     capability: CapMode,
     prompt: String,
+) -> Result<SubagentResult, String> {
+    // Single-worker path: still stream their speech under a speaker label.
+    spawn_and_wait_dialogue(
+        actor,
+        event_tx,
+        id,
+        parent_session_id,
+        parent_prompt_id,
+        description,
+        subagent_type,
+        capability,
+        prompt,
+        short_role(description),
+    )
+    .await
+}
+
+async fn spawn_and_wait_dialogue(
+    actor: &SessionActor,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<SubagentEvent>,
+    id: &str,
+    parent_session_id: &str,
+    parent_prompt_id: Option<String>,
+    description: &str,
+    subagent_type: &str,
+    capability: CapMode,
+    prompt: String,
+    label: String,
 ) -> Result<SubagentResult, String> {
     let (result_tx, result_rx) = oneshot::channel();
     let request = SubagentRequest {
@@ -1397,9 +1584,52 @@ async fn spawn_and_wait(
     event_tx
         .send(SubagentEvent::Spawn(Box::new(request)))
         .map_err(|_| "subagent coordinator channel closed".to_string())?;
-    result_rx
-        .await
-        .map_err(|_| "subagent result channel dropped".to_string())
+
+    let mut dialogue = DialogueState::new(vec![(id.to_string(), label)]);
+    let mut result_rx = result_rx;
+    let mut dialogue_tick = tokio::time::interval(DIALOGUE_POLL);
+    dialogue_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    dialogue_tick.tick().await;
+    loop {
+        tokio::select! {
+            res = &mut result_rx => {
+                // Flush residual including tiny trailing fragments.
+                force_flush_dialogue(actor, &mut dialogue).await;
+                return res.map_err(|_| "subagent result channel dropped".to_string());
+            }
+            _ = dialogue_tick.tick() => {
+                emit_dialogue_deltas(actor, &mut dialogue).await;
+            }
+        }
+    }
+}
+
+/// Final flush: emit remaining text even if under min-delta.
+async fn force_flush_dialogue(actor: &SessionActor, state: &mut DialogueState) {
+    for (child_id, label) in state.speakers.clone() {
+        let Some(dir) = state.child_dir(&child_id) else {
+            continue;
+        };
+        let full = read_child_spoken_text(&dir);
+        let already = state.emitted_len.get(&label).copied().unwrap_or(0);
+        if full.len() <= already {
+            continue;
+        }
+        let delta = full[already..].trim();
+        if delta.is_empty() {
+            continue;
+        }
+        let switch = state.current_speaker.as_deref() != Some(label.as_str());
+        let mut piece = String::new();
+        if switch {
+            piece.push_str(&format!("**{label}:**\n"));
+            state.current_speaker = Some(label.clone());
+        }
+        piece.push_str(delta);
+        piece.push('\n');
+        actor.emit_agent_text(&piece).await;
+        state.emitted_len.insert(label, full.len());
+    }
 }
 
 fn result_body(result: &Result<SubagentResult, String>) -> String {
@@ -1436,6 +1666,27 @@ fn first_line(text: &str, max_chars: usize) -> String {
         s.push('…');
     }
     s
+}
+
+/// Display label from a subagent description tag, e.g. `[Council/Analyst] …` → `Analyst`.
+fn short_role(description: &str) -> String {
+    if let Some(rest) = description.strip_prefix('[')
+        && let Some(close) = rest.find(']')
+    {
+        let tag = rest[..close].trim();
+        let role = tag
+            .rsplit(['/', '·'])
+            .next()
+            .unwrap_or(tag)
+            .trim();
+        if !role.is_empty() {
+            let mut chars = role.chars();
+            if let Some(c) = chars.next() {
+                return format!("{}{}", c.to_uppercase(), chars.as_str());
+            }
+        }
+    }
+    description.chars().take(24).collect()
 }
 
 fn extract_thesis(body: &str) -> String {
