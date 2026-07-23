@@ -32,6 +32,128 @@ path_has_dir() {
   case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac
 }
 
+# Human-readable byte size (e.g. 152M)
+human_bytes() {
+  local n="${1:-0}"
+  if command -v awk >/dev/null 2>&1; then
+    awk -v n="$n" 'BEGIN{
+      split("B K M G T", u, " ")
+      i=1
+      while (n >= 1024 && i < 5) { n/=1024; i++ }
+      if (i==1) printf "%d%s", n, u[i]
+      else printf "%.1f%s", n, u[i]
+    }'
+  else
+    printf '%sB' "$n"
+  fi
+}
+
+# Multi-step progress bar: [████████░░░░]  50%  (3/6) verifying…
+# Uses only bash + printf (no deps). Safe when stdout is piped.
+_STEP_TOTAL=7
+_STEP_CUR=0
+
+step_begin() {
+  _STEP_TOTAL="${1:-7}"
+  _STEP_CUR=0
+}
+
+step() {
+  # step "label"  — one line per phase so install history stays visible
+  _STEP_CUR=$((_STEP_CUR + 1))
+  local label="$*"
+  local width=28
+  local filled=$(( _STEP_CUR * width / _STEP_TOTAL ))
+  local empty=$(( width - filled ))
+  local pct=$(( _STEP_CUR * 100 / _STEP_TOTAL ))
+  printf '[' >&2
+  if [[ "$filled" -gt 0 ]]; then
+    printf '%*s' "$filled" '' | tr ' ' '=' >&2
+  fi
+  if [[ "$empty" -gt 0 ]]; then
+    printf '%*s' "$empty" '' | tr ' ' '.' >&2
+  fi
+  printf '] %3d%%  (%d/%d) %s\n' "$pct" "$_STEP_CUR" "$_STEP_TOTAL" "$label" >&2
+}
+
+# Download with a live progress bar (curl --progress-bar). Falls back to a
+# spinner if the transfer has no Content-Length (rare for GitHub Releases).
+download_with_progress() {
+  local url="$1" out="$2" label="${3:-downloading}"
+  local size="" code
+
+  # Probe size for a nicer label (best-effort; ignore failures / redirects body)
+  size="$(curl -fsSLI -A 'grok-swarm-install' "$url" 2>/dev/null \
+    | tr -d '\r' \
+    | awk 'tolower($1)=="content-length:"{print $2; exit}')" || true
+
+  if [[ -n "$size" && "$size" -gt 0 ]] 2>/dev/null; then
+    info "${label} $(human_bytes "$size")…"
+  else
+    info "${label}…"
+  fi
+
+  # -f fail on HTTP errors, -L follow redirects, -# progress bar to stderr,
+  # --retry for flaky networks. Do NOT use -s (it hides the bar).
+  if curl -fL --progress-bar --retry 3 --retry-delay 1 \
+      -A 'grok-swarm-install' \
+      -o "$out" "$url"; then
+    # Ensure the progress bar ends with a newline (curl usually does).
+    printf '\n' >&2
+    return 0
+  fi
+  printf '\n' >&2
+  return 1
+}
+
+# Copy a large file while showing a simple byte progress bar.
+copy_with_progress() {
+  local src="$1" dst="$2" label="${3:-installing}"
+  local total cur pct width filled empty
+  total="$(wc -c <"$src" 2>/dev/null | tr -d ' ')" || total=0
+
+  # Fast path for small files
+  if [[ -z "$total" || "$total" -lt 1048576 ]]; then
+    cp -f "$src" "$dst"
+    return 0
+  fi
+
+  # Background copy + poll destination size
+  cp -f "$src" "$dst" &
+  local pid=$!
+  width=28
+  while kill -0 "$pid" 2>/dev/null; do
+    cur=0
+    if [[ -f "$dst" ]]; then
+      cur="$(wc -c <"$dst" 2>/dev/null | tr -d ' ')" || cur=0
+    fi
+    if [[ "$total" -gt 0 ]]; then
+      pct=$(( cur * 100 / total ))
+      [[ "$pct" -gt 100 ]] && pct=100
+      filled=$(( pct * width / 100 ))
+      empty=$(( width - filled ))
+      printf '\r\033[K[' >&2
+      [[ "$filled" -gt 0 ]] && printf '%*s' "$filled" '' | tr ' ' '=' >&2
+      [[ "$empty" -gt 0 ]] && printf '%*s' "$empty" '' | tr ' ' '.' >&2
+      printf '] %3d%%  %s %s / %s' \
+        "$pct" "$label" "$(human_bytes "$cur")" "$(human_bytes "$total")" >&2
+    else
+      printf '\r\033[K→ %s %s…' "$label" "$(human_bytes "$cur")" >&2
+    fi
+    sleep 0.15
+  done
+  wait "$pid"
+  local rc=$?
+  if [[ "$rc" -eq 0 && "$total" -gt 0 ]]; then
+    printf '\r\033[K[' >&2
+    printf '%*s' "$width" '' | tr ' ' '=' >&2
+    printf '] 100%%  %s %s\n' "$label" "$(human_bytes "$total")" >&2
+  else
+    printf '\n' >&2
+  fi
+  return "$rc"
+}
+
 need_cmd curl
 need_cmd uname
 need_cmd mktemp
@@ -79,8 +201,13 @@ mkdir -p "$DOWNLOAD_DIR" "$BIN_DIR"
 tmp="$(mktemp "${DOWNLOAD_DIR}/${asset}.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 
-info "downloading ${asset}…"
-if ! curl -fsSL --retry 3 --retry-delay 1 -o "$tmp" "$url"; then
+# ── Overall install steps (download is its own live bar) ──────────────────
+# Steps after download: verify → place binary → install to PATH → codesign
+# → write config → configure shell PATH → done
+step_begin 6
+
+info "release ${tag} · ${platform}"
+if ! download_with_progress "$url" "$tmp" "downloading ${asset}"; then
   err "download failed for your platform (${platform}).
 
   URL: $url
@@ -97,6 +224,7 @@ Or build from source:
   cd grok-build-swarm && ./scripts/install-cli.sh"
 fi
 
+step "verifying binary…"
 chmod +x "$tmp"
 # macOS: re-sign after download (curl can leave a broken signature → SIGKILL).
 if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
@@ -108,6 +236,7 @@ if ! "$tmp" --version >/dev/null 2>&1; then
 File may be corrupt or blocked by security software. Re-run the installer."
 fi
 
+step "installing to ${BIN_DIR}…"
 dest="${DOWNLOAD_DIR}/${asset}"
 mv -f "$tmp" "$dest"
 trap - EXIT
@@ -124,17 +253,19 @@ else
   rel="$dest"
 fi
 ln -sfn "$rel" "$link"
-ok "linked ${link} → ${rel}"
 
 # Always copy into ~/.local/bin (most systems already have this on PATH)
+step "copying to ${LOCAL_BIN}…"
 PATH_READY=""
 if [[ -d "$LOCAL_BIN" ]] || mkdir -p "$LOCAL_BIN" 2>/dev/null; then
-  cp -f "$dest" "${LOCAL_BIN}/${BIN_NAME}"
+  # Large binary (~150MB) — show copy progress so install doesn't look stuck
+  if ! copy_with_progress "$dest" "${LOCAL_BIN}/${BIN_NAME}" "installing"; then
+    err "failed to copy binary to ${LOCAL_BIN}/${BIN_NAME}"
+  fi
   chmod +x "${LOCAL_BIN}/${BIN_NAME}"
   if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
     codesign -s - --force --timestamp=none "${LOCAL_BIN}/${BIN_NAME}" 2>/dev/null || true
   fi
-  ok "installed ${LOCAL_BIN}/${BIN_NAME}"
   if path_has_dir "$LOCAL_BIN" || path_has_dir "$BIN_DIR"; then
     PATH_READY="yes"
   fi
@@ -145,13 +276,13 @@ if [[ -z "$PATH_READY" ]] && [[ "$os" != "windows" ]]; then
   for candidate in "/usr/local/bin"; do
     if path_has_dir "$candidate" && [[ -d "$candidate" ]] && [[ -w "$candidate" ]]; then
       ln -sfn "$link" "${candidate}/${BIN_NAME}"
-      ok "symlinked ${candidate}/${BIN_NAME} → ${link}"
       PATH_READY="yes"
       break
     fi
   done
 fi
 
+step "writing config…"
 # Persist installer + auto_update in config.toml (best-effort, no deps)
 config="${GROK_HOME}/config.toml"
 mkdir -p "$GROK_HOME"
@@ -197,6 +328,7 @@ cat >"${GROK_HOME}/version-swarm.json" <<EOF
 {"version":"${version}","stable_version":"${version}","checked_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 EOF
 
+step "configuring PATH…"
 # --- Ensure grok-swarm is on PATH for future shells (and this one when possible) ---
 user_shell="$(basename "${SHELL:-}")"
 config_file=""
@@ -262,10 +394,13 @@ ${MARKER_CLOSE}"
   fi
 
   printf '\n%s\n' "$new_block" >>"$config_file"
-  ok "added PATH to ${config_file}"
 fi
 
+step "done"
 ok "installed ${BIN_NAME} v${version} (${platform})"
+ok "binary: ${link}"
+[[ -x "${LOCAL_BIN}/${BIN_NAME}" ]] && ok "binary: ${LOCAL_BIN}/${BIN_NAME}"
+[[ -n "${config_file:-}" ]] && ok "PATH configured in ${config_file}"
 echo >&2
 
 # Print version via absolute path (reliable even when PATH is not ready yet)
