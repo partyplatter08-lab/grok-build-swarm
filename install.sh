@@ -3,7 +3,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/partyplatter08-lab/grok-build-swarm/main/install.sh | bash
-#   curl -fsSL ... | bash -s -- v0.2.106          # pin a tag/version
+#   curl -fsSL ... | bash -s -- v0.2.107          # pin a tag/version
 #   GROK_SWARM_BIN_DIR=~/bin bash install.sh     # custom install dir
 #
 # Installs `grok-swarm` next to stock `grok` (does not replace it).
@@ -452,9 +452,8 @@ tmp="$(mktemp "${DOWNLOAD_DIR}/${asset}.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 
 # ── Overall install steps (download is its own live bar) ──────────────────
-# Steps after download: verify → place binary → install to PATH → codesign
-# → write config → configure shell PATH → done
-step_begin 6
+# Steps after download: verify → place → link → clean old → config → PATH
+step_begin 7
 
 info "release ${tag} · ${platform}"
 if ! download_with_progress "$url" "$tmp" "downloading ${asset}"; then
@@ -495,7 +494,7 @@ if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
   codesign -s - --force --timestamp=none "$dest" 2>/dev/null || true
 fi
 
-# Managed symlink in ~/.grok/bin/grok-swarm
+# Managed symlink in ~/.grok/bin/grok-swarm (single on-disk binary lives in downloads/)
 link="${BIN_DIR}/${BIN_NAME}"
 if [[ "$(dirname "$BIN_DIR")" == "$(dirname "$DOWNLOAD_DIR")" ]]; then
   rel="../downloads/${asset}"
@@ -504,18 +503,12 @@ else
 fi
 ln -sfn "$rel" "$link"
 
-# Always copy into ~/.local/bin (most systems already have this on PATH)
-step "copying to ${LOCAL_BIN}…"
+# Symlink into ~/.local/bin — never a second full ~150MB copy
+step "linking into ${LOCAL_BIN}…"
 PATH_READY=""
 if [[ -d "$LOCAL_BIN" ]] || mkdir -p "$LOCAL_BIN" 2>/dev/null; then
-  # Large binary (~150MB) — show copy progress so install doesn't look stuck
-  if ! copy_with_progress "$dest" "${LOCAL_BIN}/${BIN_NAME}" "installing"; then
-    err "failed to copy binary to ${LOCAL_BIN}/${BIN_NAME}"
-  fi
-  chmod +x "${LOCAL_BIN}/${BIN_NAME}"
-  if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
-    codesign -s - --force --timestamp=none "${LOCAL_BIN}/${BIN_NAME}" 2>/dev/null || true
-  fi
+  # Prefer absolute path so the link still works if cwd differs
+  ln -sfn "$link" "${LOCAL_BIN}/${BIN_NAME}"
   if path_has_dir "$LOCAL_BIN" || path_has_dir "$BIN_DIR"; then
     PATH_READY="yes"
   fi
@@ -531,6 +524,24 @@ if [[ -z "$PATH_READY" ]] && [[ "$os" != "windows" ]]; then
     fi
   done
 fi
+
+# Drop older grok-swarm downloads so installs do not pile up ~150MB copies
+step "cleaning old downloads…"
+for old in "${DOWNLOAD_DIR}/${BIN_NAME}-"*; do
+  [[ -e "$old" ]] || continue
+  [[ -f "$old" ]] || continue
+  # keep the asset we just installed
+  if [[ "$(basename "$old")" == "$asset" ]]; then
+    continue
+  fi
+  # keep partials from a concurrent install? no — remove other versions
+  case "$(basename "$old")" in
+    "${BIN_NAME}-"*)
+      info "removing old $(basename "$old") ($(human_bytes "$(wc -c <"$old" | tr -d ' ')"))"
+      rm -f "$old"
+      ;;
+  esac
+done
 
 step "writing config…"
 # Persist installer + auto_update in config.toml (best-effort, no deps)
@@ -573,9 +584,13 @@ auto_update = true
 EOF
 fi
 
-# Version cache for on-disk probes
+# Version cache for on-disk probes (updater + channel label read version.json)
+checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat >"${GROK_HOME}/version.json" <<EOF
+{"version":"${version}","stable_version":"${version}","checked_at":"${checked_at}"}
+EOF
 cat >"${GROK_HOME}/version-swarm.json" <<EOF
-{"version":"${version}","stable_version":"${version}","checked_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"version":"${version}","stable_version":"${version}","checked_at":"${checked_at}"}
 EOF
 
 step "configuring PATH…"

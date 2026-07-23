@@ -48,38 +48,48 @@ if [[ ! -x "$SRC" ]]; then
   fi
 fi
 
-DEST="$PREFIX/grok-swarm"
-# Copy (not symlink) so the command keeps working if you rebuild/clean target/.
-cp -f "$SRC" "$DEST"
-chmod +x "$DEST"
-# Ad-hoc re-sign: strip/copy can invalidate the linker signature and macOS
-# then SIGKILLs the binary with "Code Signature Invalid" (looks like OOM).
+# One managed copy under ~/.grok/downloads (survives cargo clean of target/).
+# Everything else is a symlink — no duplicate 150MB binaries.
+DOWNLOAD_DIR="${GROK_HOME:-$HOME/.grok}/downloads"
+mkdir -p "$DOWNLOAD_DIR" "$HOME/.grok/bin" "$PREFIX"
+
+# Peek version from the build artifact before installing
+VER="$("$SRC" --version 2>/dev/null | head -1 | awk '{print $2}')"
+[[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || VER="0.0.0-dev"
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64|Darwin-aarch64) ASSET_NAME="grok-swarm-${VER}-macos-aarch64" ;;
+  Darwin-x86_64) ASSET_NAME="grok-swarm-${VER}-macos-x86_64" ;;
+  Linux-x86_64|Linux-amd64) ASSET_NAME="grok-swarm-${VER}-linux-x86_64" ;;
+  Linux-aarch64|Linux-arm64) ASSET_NAME="grok-swarm-${VER}-linux-aarch64" ;;
+  *) ASSET_NAME="grok-swarm-${VER}-unknown" ;;
+esac
+ASSET="$DOWNLOAD_DIR/$ASSET_NAME"
+
+cp -f "$SRC" "$ASSET"
+chmod +x "$ASSET"
 if command -v codesign >/dev/null 2>&1; then
-  codesign -s - --force --timestamp=none "$DEST" 2>/dev/null || true
+  codesign -s - --force --timestamp=none "$ASSET" 2>/dev/null || true
 fi
 
-# Also mirror under ~/.grok/bin + downloads when present (stock grok lives there).
-if [[ -d "$HOME/.grok/bin" ]]; then
-  DOWNLOAD_DIR="${GROK_HOME:-$HOME/.grok}/downloads"
-  mkdir -p "$DOWNLOAD_DIR"
-  # Managed asset name used by gh-release auto-update.
-  ASSET="$DOWNLOAD_DIR/grok-swarm-0.2.106-macos-aarch64"
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64|Darwin-aarch64) ASSET="$DOWNLOAD_DIR/grok-swarm-0.2.106-macos-aarch64" ;;
-    Darwin-x86_64) ASSET="$DOWNLOAD_DIR/grok-swarm-0.2.106-macos-x86_64" ;;
-    Linux-x86_64|Linux-amd64) ASSET="$DOWNLOAD_DIR/grok-swarm-0.2.106-linux-x86_64" ;;
-    Linux-aarch64|Linux-arm64) ASSET="$DOWNLOAD_DIR/grok-swarm-0.2.106-linux-aarch64" ;;
-  esac
-  cp -f "$SRC" "$ASSET"
-  chmod +x "$ASSET"
-  if command -v codesign >/dev/null 2>&1; then
-    codesign -s - --force --timestamp=none "$ASSET" 2>/dev/null || true
-  fi
-  ln -sfn "$ASSET" "$HOME/.grok/bin/grok-swarm"
-  echo "→ also installed to $HOME/.grok/bin/grok-swarm"
-fi
+# Drop previous grok-swarm downloads (keep only the asset we just wrote)
+for old in "$DOWNLOAD_DIR"/grok-swarm-*; do
+  [[ -f "$old" ]] || continue
+  [[ "$(basename "$old")" == "$ASSET_NAME" ]] && continue
+  echo "→ removing old $(basename "$old")"
+  rm -f "$old"
+done
 
-echo "→ installed: $DEST"
+ln -sfn "$ASSET" "$HOME/.grok/bin/grok-swarm"
+# PREFIX gets a symlink (not a copy) so rebuild/clean of target/ is fine
+DEST="$PREFIX/grok-swarm"
+ln -sfn "$HOME/.grok/bin/grok-swarm" "$DEST"
+
+checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat >"${GROK_HOME:-$HOME/.grok}/version.json" <<EOF
+{"version":"${VER}","stable_version":"${VER}","checked_at":"${checked_at}"}
+EOF
+
+echo "→ installed: $DEST → $ASSET"
 "$DEST" --version || true
 
 # Put PREFIX + ~/.grok/bin on PATH for future shells

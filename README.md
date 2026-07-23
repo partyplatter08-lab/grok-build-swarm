@@ -136,10 +136,10 @@ Check that a binary exists for your OS/CPU:
 
 Asset names look like:
 
-- `grok-swarm-0.2.106-macos-aarch64` — Apple Silicon Mac
-- `grok-swarm-0.2.106-macos-x86_64` — Intel Mac
-- `grok-swarm-0.2.106-linux-x86_64` — Linux Intel/AMD
-- `grok-swarm-0.2.106-linux-aarch64` — Linux ARM
+- `grok-swarm-<version>-macos-aarch64` — Apple Silicon Mac
+- `grok-swarm-<version>-macos-x86_64` — Intel Mac
+- `grok-swarm-<version>-linux-x86_64` — Linux Intel/AMD
+- `grok-swarm-<version>-linux-aarch64` — Linux ARM
 
 If your platform is missing, build from source (below) or open an issue.
 

@@ -60,12 +60,14 @@ GitHub Actions (`.github/workflows/release.yml`) builds multi-platform
 binaries when you push a tag:
 
 ```sh
-git tag v0.2.106
-git push origin v0.2.106
+git tag v0.2.107
+git push fork v0.2.107
 ```
 
 Assets are named `grok-swarm-{version}-{os}-{arch}`
-(e.g. `grok-swarm-0.2.106-macos-aarch64`).
+(e.g. `grok-swarm-0.2.107-macos-aarch64`). Always bump the semver when
+shipping a new binary so installers and auto-update pick it up (same
+`0.2.106` tag forever left people on the first beta).
 
 ## What’s new
 
