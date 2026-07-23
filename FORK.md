@@ -54,20 +54,29 @@ cd grok-build-swarm
 Requires Rust + [DotSlash](https://dotslash-cli.com). Auth uses the same
 `~/.grok/` credentials as stock `grok`.
 
-### Releases
+### Releases (required for every change)
 
-GitHub Actions (`.github/workflows/release.yml`) builds multi-platform
-binaries when you push a tag:
+**Policy:** every change that should be testable with `grok-swarm update`
+must ship a **new GitHub Release** (new semver). Code on `main` alone is
+not enough — the updater only looks at release tags.
 
 ```sh
-git tag v0.2.107
-git push fork v0.2.107
+# One-shot: bump patch, build, tag, push, upload asset
+./scripts/ship-release.sh
+
+# Then on any machine:
+grok-swarm update
+grok-swarm --version
 ```
 
+Options: `--minor`, `--major`, `--set 0.2.110`, `--skip-build`, `--no-push`.
+
 Assets are named `grok-swarm-{version}-{os}-{arch}`
-(e.g. `grok-swarm-0.2.107-macos-aarch64`). Always bump the semver when
-shipping a new binary so installers and auto-update pick it up (same
-`0.2.106` tag forever left people on the first beta).
+(e.g. `grok-swarm-0.2.107-macos-aarch64`). Leaving the tag at the same
+version forever makes `update` report “up to date” while `main` moves on.
+
+Optional CI (`.github/workflows/release.yml`) can also build multi-platform
+binaries on tag push.
 
 ## What’s new
 

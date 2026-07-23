@@ -48,6 +48,15 @@ Only **one** `grok-swarm` binary is kept on disk (`~/.grok/downloads/…`).
 Older versions are deleted after a successful install/update so 20 upgrades
 do not leave 20 × ~150MB copies behind. PATH entries are symlinks, not copies.
 
+**Maintainers:** every change you want people to pull via `grok-swarm update`
+needs a new GitHub Release. Use:
+
+```sh
+./scripts/ship-release.sh    # bump patch → build → tag → upload
+```
+
+See [FORK.md](FORK.md#releases-required-for-every-change).
+
 ---
 
 ## Quick start
