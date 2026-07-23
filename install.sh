@@ -76,33 +76,156 @@ step() {
   printf '] %3d%%  (%d/%d) %s\n' "$pct" "$_STEP_CUR" "$_STEP_TOTAL" "$label" >&2
 }
 
-# Download with a live progress bar (curl --progress-bar). Falls back to a
-# spinner if the transfer has no Content-Length (rare for GitHub Releases).
+# Draw one progress line. Uses \r when stderr is a TTY; otherwise prints a
+# fresh line every tick so `curl | bash` / IDE terminals still show movement.
+_draw_bar() {
+  local pct="$1" cur_h="$2" total_h="$3" label="$4" speed_h="${5:-}"
+  local width=30 filled empty line
+  if [[ "$pct" -gt 100 ]]; then pct=100; fi
+  if [[ "$pct" -lt 0 ]]; then pct=0; fi
+  filled=$(( pct * width / 100 ))
+  empty=$(( width - filled ))
+  line='['
+  if [[ "$filled" -gt 0 ]]; then
+    line+=$(printf '%*s' "$filled" '' | tr ' ' '=')
+  fi
+  if [[ "$empty" -gt 0 ]]; then
+    line+=$(printf '%*s' "$empty" '' | tr ' ' '.')
+  fi
+  line+="] ${pct}%  ${label}  ${cur_h}"
+  if [[ -n "$total_h" && "$total_h" != "0B" ]]; then
+    line+=" / ${total_h}"
+  fi
+  if [[ -n "$speed_h" ]]; then
+    line+="  ${speed_h}/s"
+  fi
+  if [[ -t 2 ]]; then
+    printf '\r\033[K%s' "$line" >&2
+  else
+    # Non-TTY (some IDE terminals / redirected stderr): print full lines.
+    printf '%s\n' "$line" >&2
+  fi
+}
+
+# Download with a live progress bar that always works.
+# curl's own --progress-bar is silent when stderr is not a TTY and can look
+# "stuck" for minutes on a ~150MB binary. We run curl in the background and
+# poll the output file size ourselves so every environment sees updates.
 download_with_progress() {
   local url="$1" out="$2" label="${3:-downloading}"
-  local size="" code
+  local size=0 cur=0 last=0 pct=0 speed=0
+  local pid rc tick=0 stalled=0
+  local curl_log err_line
 
-  # Probe size for a nicer label (best-effort; ignore failures / redirects body)
-  size="$(curl -fsSLI -A 'grok-swarm-install' "$url" 2>/dev/null \
-    | tr -d '\r' \
-    | awk 'tolower($1)=="content-length:"{print $2; exit}')" || true
+  # Probe final Content-Length (GitHub returns 0 on the redirect hop first).
+  # Keep it short so a hung HEAD never blocks the real download.
+  size="$(
+    curl -fsSIL --connect-timeout 10 --max-time 20 \
+      -A 'grok-swarm-install' "$url" 2>/dev/null \
+      | tr -d '\r' \
+      | awk 'tolower($1)=="content-length:" && $2+0 > 0 { n=$2 } END { if (n) print n; else print 0 }'
+  )" || size=0
+  # sanitize
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
 
-  if [[ -n "$size" && "$size" -gt 0 ]] 2>/dev/null; then
-    info "${label} $(human_bytes "$size")…"
+  if [[ "$size" -gt 0 ]]; then
+    info "${label} ($(human_bytes "$size"))…"
   else
     info "${label}…"
   fi
+  info "this is ~150MB — first bytes can take a few seconds on slow links"
 
-  # -f fail on HTTP errors, -L follow redirects, -# progress bar to stderr,
-  # --retry for flaky networks. Do NOT use -s (it hides the bar).
-  if curl -fL --progress-bar --retry 3 --retry-delay 1 \
-      -A 'grok-swarm-install' \
-      -o "$out" "$url"; then
-    # Ensure the progress bar ends with a newline (curl usually does).
+  # Truncate / create destination so size polling starts at 0
+  : >"$out"
+  curl_log="$(mktemp "${TMPDIR:-/tmp}/grok-swarm-curl.XXXXXX")"
+
+  # Silent curl in background; we own the UI. --fail-with-body not portable;
+  # use -f and capture stderr to the log for error messages.
+  # connect-timeout avoids hanging forever on a bad network.
+  curl -fL --connect-timeout 30 --retry 3 --retry-delay 2 \
+    -A 'grok-swarm-install' \
+    -o "$out" "$url" \
+    >"$curl_log" 2>&1 &
+  pid=$!
+
+  last=0
+  tick=0
+  stalled=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [[ -f "$out" ]]; then
+      cur="$(wc -c <"$out" 2>/dev/null | tr -d ' ')" || cur=0
+    else
+      cur=0
+    fi
+    [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+
+    speed=$(( cur > last ? cur - last : 0 ))
+    # poll every ~0.5s → speed is bytes per tick; scale to /s
+    speed=$(( speed * 2 ))
+
+    if [[ "$size" -gt 0 ]]; then
+      pct=$(( cur * 100 / size ))
+      _draw_bar "$pct" "$(human_bytes "$cur")" "$(human_bytes "$size")" "$label" "$(human_bytes "$speed")"
+    else
+      # Unknown total: indeterminate-style counter
+      _draw_bar "$(( tick % 100 ))" "$(human_bytes "$cur")" "" "$label" "$(human_bytes "$speed")"
+    fi
+
+    if [[ "$cur" -eq "$last" ]]; then
+      stalled=$((stalled + 1))
+    else
+      stalled=0
+    fi
+    # ~60s with no growth → warn (still waiting on curl/retry)
+    if [[ "$stalled" -eq 120 ]]; then
+      printf '\n' >&2
+      warn "download has not received new data for ~60s — still waiting (curl may be retrying)…"
+    fi
+    if [[ "$stalled" -ge 360 ]]; then
+      # ~3 minutes stalled
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      printf '\n' >&2
+      err_line="$(tr -d '\r' <"$curl_log" 2>/dev/null | tail -3 | tr '\n' ' ')"
+      rm -f "$curl_log"
+      err "download stalled with no data for ~3 minutes.
+${err_line}
+URL: $url
+Check your network, VPN, or GitHub access and re-run the installer."
+    fi
+
+    last=$cur
+    tick=$((tick + 1))
+    sleep 0.5
+  done
+
+  # set -e would abort on a failed wait; capture rc explicitly
+  rc=0
+  wait "$pid" || rc=$?
+  cur=0
+  [[ -f "$out" ]] && cur="$(wc -c <"$out" 2>/dev/null | tr -d ' ')" || true
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+
+  if [[ "$rc" -eq 0 ]]; then
+    if [[ "$size" -gt 0 ]]; then
+      _draw_bar 100 "$(human_bytes "$cur")" "$(human_bytes "$size")" "$label" ""
+    else
+      _draw_bar 100 "$(human_bytes "$cur")" "" "$label" ""
+    fi
     printf '\n' >&2
+    rm -f "$curl_log"
+    # Sanity: empty file is never a valid binary
+    if [[ "$cur" -lt 1000000 ]]; then
+      err "download finished but file is only $(human_bytes "$cur") — expected ~150MB.
+URL: $url"
+    fi
     return 0
   fi
+
   printf '\n' >&2
+  err_line="$(tr -d '\r' <"$curl_log" 2>/dev/null | tail -5)"
+  rm -f "$curl_log"
+  printf '%s\n' "$err_line" >&2
   return 1
 }
 
