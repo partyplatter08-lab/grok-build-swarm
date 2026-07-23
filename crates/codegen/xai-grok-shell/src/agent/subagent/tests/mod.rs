@@ -1271,6 +1271,7 @@ fn dummy_tracker(
         tool_context,
         model_id: acp::ModelId::new("test"),
         reasoning_effort: None,
+        orchestration_mode: None,
         yolo_mode: false,
         origin_client: None,
         code_nav_enabled: false,

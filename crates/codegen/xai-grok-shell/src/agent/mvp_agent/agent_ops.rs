@@ -2289,18 +2289,39 @@ impl MvpAgent {
             .and_then(|sid| self.sessions.borrow().get(sid).map(|h| h.reasoning_effort))
             .flatten()
             .or_else(|| self.models_manager.current_reasoning_effort());
-        if let Some(override_effort) = override_effort
-            && let Some(info) = available_models
-                .iter_mut()
-                .find(|info| info.model_id == model_id)
-            && supports_reasoning_effort_meta(info.meta.as_ref())
+        let override_orchestration = session_id.and_then(|sid| {
+            self.sessions
+                .borrow()
+                .get(sid)
+                .and_then(|h| h.orchestration_mode.clone())
+        });
+        if let Some(info) = available_models
+            .iter_mut()
+            .find(|info| info.model_id == model_id)
         {
             let mut map = info.meta.clone().unwrap_or_default();
-            map.insert(
-                REASONING_EFFORT_META_KEY.to_string(),
-                reasoning_effort_meta_value(override_effort),
-            );
-            info.meta = Some(map);
+            let mut stamped = false;
+            if let Some(override_effort) = override_effort
+                && supports_reasoning_effort_meta(info.meta.as_ref())
+            {
+                map.insert(
+                    REASONING_EFFORT_META_KEY.to_string(),
+                    reasoning_effort_meta_value(override_effort),
+                );
+                stamped = true;
+            }
+            // Stamp multi-agent option id so resume can restore Heavy/Swarm UI
+            // (wire effort alone is always xhigh for those modes).
+            if let Some(ref oid) = override_orchestration {
+                map.insert(
+                    ORCHESTRATION_MODE_META_KEY.to_string(),
+                    serde_json::Value::String(oid.clone()),
+                );
+                stamped = true;
+            }
+            if stamped {
+                info.meta = Some(map);
+            }
         }
         acp::SessionModelState::new(model_id, available_models)
     }
@@ -3499,6 +3520,7 @@ impl MvpAgent {
                     model_id: session_model_id.clone(),
                     agent_name: Some(agent_definition.name.clone()),
                     reasoning_effort: initial_reasoning_effort,
+                    orchestration_mode: None,
                 });
             let acp_mcp_servers = crate::session::acp_mcp::parse_acp_mcp_servers(
                 session_meta,

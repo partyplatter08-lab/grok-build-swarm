@@ -1050,6 +1050,7 @@ pub(crate) async fn handle_subagent_request(
             model_id: effective_model_id.clone(),
             agent_name: Some(definition.name.clone()),
             reasoning_effort: Some(effective_sampling_config.reasoning_effort),
+            orchestration_mode: None,
         });
     let forked_tool_override = if verbatim_mirror_fork {
         ctx.parent_tool_snapshot.clone()

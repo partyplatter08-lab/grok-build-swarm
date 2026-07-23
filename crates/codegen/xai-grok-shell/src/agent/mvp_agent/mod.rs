@@ -58,8 +58,8 @@ use crate::agent::folder_trust;
 use crate::agent::models::{resolve_catalog_key, selectable_catalog_key_for_persisted};
 use crate::agent::session_config;
 use xai_grok_sampling_types::{
-    REASONING_EFFORT_META_KEY, ReasoningEffortOption, reasoning_effort_meta_value,
-    supports_reasoning_effort_meta,
+    ORCHESTRATION_MODE_META_KEY, REASONING_EFFORT_META_KEY, ReasoningEffortOption,
+    reasoning_effort_meta_value, supports_reasoning_effort_meta,
 };
 use crate::agent::update_chunk_merge;
 use crate::auth::AuthManager;

@@ -199,12 +199,14 @@ pub(crate) async fn apply(
         )
     };
     let (tx, rx) = oneshot::channel();
+    let orchestration_option_id = orchestration_mode.option_id().map(|s| s.to_string());
     let _ = handle.cmd_tx.send(SessionCommand::SetSessionModel {
         sampling_config: model_sampling,
         use_concise,
         apply_prompt_override,
         skip_prompt_rewrite: did_rebuild || model_unchanged,
         auto_compact_threshold_percent: new_threshold,
+        orchestration_mode: orchestration_option_id.clone(),
         responds_to: tx,
     });
     let updated_model = rx
@@ -213,6 +215,7 @@ pub(crate) async fn apply(
     if let Some(handle) = agent.sessions.borrow_mut().get_mut(&session_id) {
         handle.model_id = model_id.clone();
         handle.reasoning_effort = applied_effort;
+        handle.orchestration_mode = orchestration_option_id;
         handle.agent_name =
             agent_name_after_model_switch(did_rebuild, &required_agent_type, &handle.agent_name);
         // Inject multi-agent protocol into the live system prompt when a

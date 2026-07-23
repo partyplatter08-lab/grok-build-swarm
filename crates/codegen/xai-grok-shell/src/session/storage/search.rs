@@ -1351,6 +1351,7 @@ mod tests {
             agent_name: None,
             sandbox_profile: None,
             reasoning_effort: None,
+            orchestration_mode: None,
         }
     }
 

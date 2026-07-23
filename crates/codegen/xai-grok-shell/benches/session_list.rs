@@ -519,6 +519,7 @@ fn write_summary(
         agent_name: Some("benchmark-agent".to_owned()),
         sandbox_profile: Some("workspace".to_owned()),
         reasoning_effort: None,
+        orchestration_mode: None,
     };
     let summary_path = session_dir.join("summary.json");
     let bytes = serde_json::to_vec_pretty(&summary).expect("serialize summary");

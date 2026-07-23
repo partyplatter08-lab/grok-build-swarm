@@ -3,8 +3,9 @@
 use agent_client_protocol as acp;
 use indexmap::IndexMap;
 use xai_grok_shell::sampling::types::{
-    OrchestrationMode, ReasoningEffort, ReasoningEffortOption, merge_multi_agent_effort_options,
-    parse_reasoning_effort_meta, parse_reasoning_efforts_meta, supports_reasoning_effort_meta,
+    ORCHESTRATION_MODE_META_KEY, OrchestrationMode, ReasoningEffort, ReasoningEffortOption,
+    merge_multi_agent_effort_options, parse_reasoning_effort_meta, parse_reasoning_efforts_meta,
+    supports_reasoning_effort_meta,
 };
 
 use crate::slash::commands::effort_levels::{effort_display_label, legacy_effort_options};
@@ -393,16 +394,27 @@ impl From<Option<acp::SessionModelState>> for ModelState {
                 let current_model = models
                     .contains_key(&state.current_model_id)
                     .then_some(state.current_model_id);
-                let reasoning_effort = current_model
+                let current_meta = current_model
                     .as_ref()
                     .and_then(|id| models.get(id))
-                    .and_then(|info| parse_reasoning_effort_meta(info.meta.as_ref()));
+                    .and_then(|info| info.meta.as_ref());
+                let reasoning_effort = parse_reasoning_effort_meta(current_meta);
+                // Prefer multi-agent option id (heavy/swarm/swarm-heavy) when
+                // the agent stamped orchestrationMode on the current model.
+                // Wire reasoningEffort alone is always xhigh for those modes,
+                // so resume would otherwise collapse to the plain "xhigh" label.
+                let orchestration_option_id = current_meta
+                    .and_then(|m| m.get(ORCHESTRATION_MODE_META_KEY))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|id| OrchestrationMode::from_option_id(id).is_multi_agent());
+                let reasoning_effort_option_id = orchestration_option_id
+                    .or_else(|| reasoning_effort.map(|e| e.as_str().to_string()));
                 Self {
                     available: models,
                     current: current_model,
                     reasoning_effort,
-                    reasoning_effort_option_id: reasoning_effort
-                        .map(|e| e.as_str().to_string()),
+                    reasoning_effort_option_id,
                     context_window_override: None,
                 }
             })
@@ -495,6 +507,27 @@ mod tests {
             Some(ReasoningEffort::Xhigh),
             "catalog refresh must not clobber a user-set per-session effort"
         );
+    }
+
+    #[test]
+    fn from_session_model_state_restores_orchestration_option_id() {
+        let id = acp::ModelId::new(Arc::from("grok-4"));
+        let mut info = model_with_effort("grok-4", "Grok 4", "xhigh");
+        let mut meta = info.meta.take().unwrap_or_default();
+        meta.insert(
+            ORCHESTRATION_MODE_META_KEY.to_string(),
+            serde_json::Value::String("heavy".into()),
+        );
+        info.meta = Some(meta);
+        let session = acp::SessionModelState::new(id, vec![info]);
+        let state = ModelState::from(Some(session));
+        assert_eq!(state.reasoning_effort, Some(ReasoningEffort::Xhigh));
+        assert_eq!(
+            state.reasoning_effort_option_id.as_deref(),
+            Some("heavy"),
+            "LoadSession models must restore multi-agent option id, not plain xhigh"
+        );
+        assert_eq!(state.orchestration_mode(), OrchestrationMode::Heavy);
     }
 
     #[test]

@@ -893,6 +893,7 @@ impl JsonlStorageAdapter {
             agent_name: source_summary.agent_name,
             sandbox_profile: source_summary.sandbox_profile,
             reasoning_effort: source_summary.reasoning_effort,
+            orchestration_mode: source_summary.orchestration_mode,
         };
         let summary_bytes = serde_json::to_vec_pretty(&target_summary)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1127,6 +1128,7 @@ impl StorageAdapter for JsonlStorageAdapter {
         model_id: &acp::ModelId,
         agent_name: Option<&str>,
         reasoning_effort: Option<Option<xai_grok_sampling_types::ReasoningEffort>>,
+        orchestration_mode: Option<Option<String>>,
     ) -> io::Result<()> {
         self.apply_summary_patch(
             info,
@@ -1135,6 +1137,7 @@ impl StorageAdapter for JsonlStorageAdapter {
                     model_id: model_id.clone(),
                     agent_name: agent_name.map(String::from),
                     reasoning_effort,
+                    orchestration_mode,
                 }),
                 ..Default::default()
             },

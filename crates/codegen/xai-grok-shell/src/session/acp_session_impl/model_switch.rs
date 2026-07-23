@@ -9,6 +9,9 @@ impl SessionActor {
         apply_prompt_override: bool,
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
+        // Multi-agent option id to persist (`heavy` / `swarm` / `swarm-heavy`),
+        // or `None` to clear. Always written (resume needs the last value).
+        orchestration_mode: Option<String>,
     ) -> Result<acp::ModelId, acp::Error> {
         let model_id = acp::ModelId::new(sampling_config.model.clone());
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
@@ -112,6 +115,7 @@ impl SessionActor {
                 model_id: model_id.clone(),
                 agent_name: Some(agent_name),
                 reasoning_effort: Some(sampling_config.reasoning_effort),
+                orchestration_mode: Some(orchestration_mode),
             });
         Ok(model_id)
     }

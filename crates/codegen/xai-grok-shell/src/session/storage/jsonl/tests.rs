@@ -83,6 +83,7 @@ async fn update_current_model_persists_leaves_and_clears_reasoning_effort() {
             &model,
             None,
             Some(Some(ReasoningEffort::High)),
+            None,
         )
         .await
         .unwrap();
@@ -97,10 +98,34 @@ async fn update_current_model_persists_leaves_and_clears_reasoning_effort() {
         "model-only update must not wipe the persisted effort",
     );
     adapter
-        .update_current_model_and_agent(&info, &model, None, Some(None))
+        .update_current_model_and_agent(&info, &model, None, Some(None), None)
         .await
         .unwrap();
     assert_eq!(adapter.read_summary_sync(& info).unwrap().reasoning_effort, None,);
+
+    // Multi-agent option id must round-trip independently of wire effort.
+    adapter
+        .update_current_model_and_agent(
+            &info,
+            &model,
+            None,
+            Some(Some(ReasoningEffort::Xhigh)),
+            Some(Some("heavy".into())),
+        )
+        .await
+        .unwrap();
+    let summary = adapter.read_summary_sync(&info).unwrap();
+    assert_eq!(summary.reasoning_effort, Some(ReasoningEffort::Xhigh));
+    assert_eq!(summary.orchestration_mode.as_deref(), Some("heavy"));
+    adapter
+        .update_current_model_and_agent(&info, &model, None, None, Some(None))
+        .await
+        .unwrap();
+    assert_eq!(
+        adapter.read_summary_sync(&info).unwrap().orchestration_mode,
+        None,
+        "Some(None) must clear orchestration_mode"
+    );
 }
 #[tokio::test]
 async fn test_jsonl_round_trip() {
@@ -1804,6 +1829,7 @@ fn write_test_summary(
         agent_name: None,
         sandbox_profile: None,
         reasoning_effort: None,
+        orchestration_mode: None,
     };
     let json = serde_json::to_vec_pretty(&summary).unwrap();
     std::fs::write(session_dir.join("summary.json"), json).unwrap();

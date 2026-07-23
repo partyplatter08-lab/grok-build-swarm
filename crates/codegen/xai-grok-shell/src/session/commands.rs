@@ -195,6 +195,8 @@ pub enum SessionCommand {
         /// `compaction.threshold_percent` (which is `Cell<u8>` so it can
         /// update without `&mut self`).
         auto_compact_threshold_percent: u8,
+        /// Multi-agent effort option id to persist, or `None` to clear.
+        orchestration_mode: Option<String>,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
     },
     /// Zero-turn harness rebuild: build a brand-new `Agent` from the

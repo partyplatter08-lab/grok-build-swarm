@@ -1161,6 +1161,7 @@ fn make_test_handle(
         ),
         model_id: acp::ModelId::new(model),
         reasoning_effort: None,
+        orchestration_mode: None,
         yolo_mode: yolo,
         origin_client: client_id.map(|s| crate::http::OriginClientInfo {
             product: s.to_string(),

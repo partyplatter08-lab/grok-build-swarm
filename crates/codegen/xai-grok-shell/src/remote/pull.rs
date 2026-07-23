@@ -152,6 +152,7 @@ pub(crate) mod hydrate {
             // Hydrated locally — record the profile this process runs under.
             sandbox_profile: xai_grok_sandbox::configured_profile_name().map(String::from),
             reasoning_effort: None,
+            orchestration_mode: None,
         };
 
         let json = serde_json::to_string_pretty(&summary)?;

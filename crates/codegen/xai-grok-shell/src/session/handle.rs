@@ -106,6 +106,8 @@ pub struct SessionHandle {
     /// where `MvpAgent.current_model_id` is shared mutable state.
     pub model_id: acp::ModelId,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Multi-agent effort option id (`heavy` / `swarm` / `swarm-heavy`), if any.
+    pub orchestration_mode: Option<String>,
     /// YOLO (auto-approve) mode for this session.
     /// Per-session tracking prevents cross-client contamination in leader mode
     /// where one client enabling YOLO could affect another client's sessions.

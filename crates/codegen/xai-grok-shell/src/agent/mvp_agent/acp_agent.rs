@@ -1848,16 +1848,27 @@ impl acp::Agent for MvpAgent {
         );
         {
             let _timer = crate::instrumentation_timer!("session.restore_model");
-            let restore_meta = summary
-                .reasoning_effort
-                .map(|effort| {
-                    let mut map = acp::Meta::new();
+            // Restore both wire effort and multi-agent option id. Without
+            // orchestrationMode, resume collapses Heavy/Swarm → plain xhigh.
+            let restore_meta = {
+                let mut map = acp::Meta::new();
+                let mut any = false;
+                if let Some(effort) = summary.reasoning_effort {
                     map.insert(
                         REASONING_EFFORT_META_KEY.to_string(),
                         reasoning_effort_meta_value(effort),
                     );
-                    map
-                });
+                    any = true;
+                }
+                if let Some(ref mode) = summary.orchestration_mode {
+                    map.insert(
+                        ORCHESTRATION_MODE_META_KEY.to_string(),
+                        serde_json::Value::String(mode.clone()),
+                    );
+                    any = true;
+                }
+                any.then_some(map)
+            };
             let _ = crate::agent::handlers::model_switch::apply(
                     self,
                     acp::SetSessionModelRequest::new(session_id.to_owned(), model_id)

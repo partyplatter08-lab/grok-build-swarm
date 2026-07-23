@@ -297,6 +297,9 @@ pub enum PersistenceMsg {
         /// on the mutable model catalog.
         agent_name: Option<String>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
+        /// Multi-agent option id. Outer `None` = leave unchanged; `Some(None)` =
+        /// clear; `Some(Some(id))` = set (e.g. `"heavy"`).
+        orchestration_mode: Option<Option<String>>,
     },
     PlanState(TodoState),
     /// Plan mode lifecycle state to persist
@@ -870,6 +873,11 @@ pub struct Summary {
     pub sandbox_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Multi-agent effort menu option id (`heavy` / `swarm` / `swarm-heavy`).
+    /// Distinct from wire `reasoning_effort` (always `xhigh` for multi-agent)
+    /// so resume can restore Heavy/Swarm UI + protocol inject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration_mode: Option<String>,
 }
 
 /// Current `grok_home` as a UTF-8 string, or `None` if the path isn't valid UTF-8.
@@ -922,6 +930,7 @@ impl Summary {
             agent_name: None,
             sandbox_profile: None,
             reasoning_effort: None,
+            orchestration_mode: None,
         })
     }
 
@@ -1006,6 +1015,26 @@ mod is_hidden_tests {
         s.reasoning_effort = Some(ReasoningEffort::Xhigh);
         let json = serde_json::to_string(&s).unwrap();
         let back: Summary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reasoning_effort, Some(ReasoningEffort::Xhigh));
+    }
+
+    #[test]
+    fn summary_round_trips_orchestration_mode() {
+        let mut s = summary_with_kind(None);
+        s.orchestration_mode = None;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("orchestration_mode"),
+            "None orchestration_mode must not be serialized"
+        );
+        let back: Summary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.orchestration_mode, None);
+
+        s.orchestration_mode = Some("heavy".into());
+        s.reasoning_effort = Some(ReasoningEffort::Xhigh);
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Summary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.orchestration_mode.as_deref(), Some("heavy"));
         assert_eq!(back.reasoning_effort, Some(ReasoningEffort::Xhigh));
     }
 
@@ -1715,6 +1744,7 @@ impl SessionPersistence {
                     model_id,
                     agent_name,
                     reasoning_effort,
+                    orchestration_mode,
                 } => {
                     if let Err(e) = self
                         .storage
@@ -1723,6 +1753,7 @@ impl SessionPersistence {
                             &model_id,
                             agent_name.as_deref(),
                             reasoning_effort,
+                            orchestration_mode,
                         )
                         .await
                     {

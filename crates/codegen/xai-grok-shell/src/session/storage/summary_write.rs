@@ -48,6 +48,8 @@ pub(crate) struct ModelPatch {
     pub model_id: acp::ModelId,
     pub agent_name: Option<String>,
     pub reasoning_effort: Option<Option<ReasoningEffort>>,
+    /// Outer `None` = leave; `Some(None)` = clear; `Some(Some(id))` = set.
+    pub orchestration_mode: Option<Option<String>>,
 }
 
 /// Persisted git HEAD. `commit` and `branch` are last-writer-wins, including
@@ -136,6 +138,9 @@ impl Summary {
             }
             if let Some(reasoning_effort) = &model.reasoning_effort {
                 self.reasoning_effort = *reasoning_effort;
+            }
+            if let Some(orchestration_mode) = &model.orchestration_mode {
+                self.orchestration_mode = orchestration_mode.clone();
             }
         }
         if let Some(git_head) = &patch.git_head {
