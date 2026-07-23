@@ -439,15 +439,51 @@ pub fn ensure_session_id_available(session_id: &str, cwd: &str) -> anyhow::Resul
     }
     Ok(())
 }
+/// Resolve the process working directory, resilient to macOS TCC / File Provider
+/// quirks where `getcwd(3)` returns `EPERM` on Documents/Desktop/iCloud paths
+/// even though the shell's `$PWD` is still valid.
+pub fn resolve_process_cwd() -> anyhow::Result<std::path::PathBuf> {
+    match std::env::current_dir() {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            // Prefer the shell-exported PWD — Terminal still knows the path even
+            // when the kernel refuses to reconstruct it for this process.
+            if let Ok(pwd) = std::env::var("PWD") {
+                let p = PathBuf::from(pwd.trim());
+                if p.is_absolute() && !pwd.trim().is_empty() {
+                    // Best-effort re-sync so later `current_dir()` calls succeed.
+                    let _ = std::env::set_current_dir(&p);
+                    tracing::warn!(
+                        error = %e,
+                        pwd = %p.display(),
+                        "getcwd failed; using $PWD (common on macOS Documents/Desktop privacy)"
+                    );
+                    return Ok(p);
+                }
+            }
+            Err(anyhow::anyhow!(
+                "Failed to get cwd: {e}\n\
+                 \n\
+                 On macOS this usually means the terminal app cannot access this folder\n\
+                 (Documents, Desktop, Downloads, or iCloud). Fix one of:\n\
+                   1. System Settings → Privacy & Security → Files and Folders\n\
+                      (or Full Disk Access) → enable your Terminal / iTerm / IDE\n\
+                   2. Open a new terminal window after granting access\n\
+                   3. Work around:  cd ~ && grok-swarm --cwd \"{suggested}\"\n\
+                 \n\
+                 Tip: run from a non-protected path (e.g. ~/Developer/...) if possible.",
+                suggested = std::env::var("PWD").unwrap_or_else(|_| "/path/to/project".into()),
+            ))
+        }
+    }
+}
+
 /// Materialize CLI intent into a concrete startup plan (I/O + remote restore).
 pub async fn materialize_startup(
     ctx: MaterializeCtx,
     intent: SessionStartupIntent,
 ) -> anyhow::Result<MaterializedStartup> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("Failed to get cwd: {e}"))?
-        .to_string_lossy()
-        .to_string();
+    let cwd = resolve_process_cwd()?.to_string_lossy().to_string();
     materialize_startup_for_cwd(ctx, intent, &cwd).await
 }
 /// Same as [`materialize_startup`] but with an explicit process cwd (tests / headless).

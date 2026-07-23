@@ -841,6 +841,10 @@ impl PagerArgs {
             std::env::set_current_dir(cwd).map_err(|e| {
                 anyhow::anyhow!("Failed to set working directory to {:?}: {}", cwd, e)
             })?;
+        } else {
+            // macOS Documents/Desktop/iCloud: getcwd can EPERM while $PWD is fine.
+            // Resolve early so the rest of startup sees a usable process cwd.
+            let _ = crate::app::session_startup::resolve_process_cwd()?;
         }
         Ok(args)
     }
