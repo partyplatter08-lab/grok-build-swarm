@@ -135,6 +135,11 @@ pub(crate) async fn upload_tool_definitions(
     }
 }
 /// `restorable_turn_number` is not advanced without a cloud archive.
+///
+/// Bounded wait: a hung session actor (stuck tool / dead channel) must not
+/// block subagent finalization forever. Callers historically awaited this
+/// *before* emitting `SubagentFinished`, which left failed/cancelled kids
+/// stuck as "running" in the pager with cancel appearing to do nothing.
 pub(crate) async fn upload_session_state(
     _ctx: &PromptTraceContext,
     _phase: &str,
@@ -143,7 +148,10 @@ pub(crate) async fn upload_session_state(
     >,
     _wait: UploadWait,
 ) -> super::turn::UploadOutcome {
-    let _ = session_copy_rx.await;
+    const COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    match tokio::time::timeout(COPY_TIMEOUT, session_copy_rx).await {
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+    }
     super::turn::UploadOutcome::Failed {
         reason: "session_state_upload_unavailable",
         status_code: None,

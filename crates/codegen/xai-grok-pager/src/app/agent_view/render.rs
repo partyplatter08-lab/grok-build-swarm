@@ -998,12 +998,67 @@ impl AgentView {
                     task.kill_requested_at = None;
                 }
             }
+            // Kill timed out with no SubagentFinished (e.g. shell stuck on
+            // post-cancel cleanup historically). Force-terminalize the row so
+            // the card does not flip back to "running" and leave the user
+            // unable to clear it. Real finish notifications remain idempotent.
+            let mut force_finished: Vec<(
+                crate::scrollback::entry::EntryId,
+                std::sync::Arc<str>,
+                std::time::Duration,
+                bool,
+            )> = Vec::new();
             for info in self.subagent_sessions.values_mut() {
                 if let Some(requested) = info.kill_requested_at
                     && now.duration_since(requested).as_secs() >= PENDING_KILL_TIMEOUT_SECS
                 {
                     info.pending_kill = false;
                     info.kill_requested_at = None;
+                    if !info.finished {
+                        let elapsed = info.display_elapsed();
+                        info.finished = true;
+                        info.status = Some(std::sync::Arc::from("cancelled"));
+                        info.error = Some(std::sync::Arc::from(
+                            "Cancel timed out — subagent marked cancelled",
+                        ));
+                        info.activity_label = None;
+                        info.duration_ms = Some(elapsed.as_millis() as u64);
+                        info.last_progress_at = now;
+                        if let Some(eid) = info.scrollback_entry_id {
+                            force_finished.push((
+                                eid,
+                                info.subagent_id.clone(),
+                                elapsed,
+                                info.is_background,
+                            ));
+                        }
+                    }
+                }
+            }
+            for (eid, subagent_id, elapsed, is_background) in force_finished {
+                self.scrollback.finish_running(eid);
+                if let Some(entry) = self.scrollback.get_by_id_mut(eid)
+                    && let crate::scrollback::block::RenderBlock::Subagent(ref mut sb) =
+                        entry.block
+                {
+                    if is_background {
+                        // Background rows keep the started line and add a
+                        // terminal line via SubagentFinished; synthesize the
+                        // kind on the started block so it stops animating.
+                        sb.kind = crate::scrollback::blocks::SubagentBlockKind::Cancelled {
+                            elapsed,
+                        };
+                    } else {
+                        sb.kind = crate::scrollback::blocks::SubagentBlockKind::Cancelled {
+                            elapsed,
+                        };
+                    }
+                    sb.activity_label = None;
+                    entry.invalidate_cache();
+                    tracing::info!(
+                        %subagent_id,
+                        "subagent kill timeout: force-finished stuck running row"
+                    );
                 }
             }
         }

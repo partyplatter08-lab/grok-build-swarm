@@ -487,8 +487,11 @@ impl SubagentCoordinator {
     /// - Already finished → return AlreadyFinished with terminal status
     /// - Unknown ID → return NotFound
     pub fn cancel_with_outcome(&mut self, subagent_id: &str) -> SubagentCancelOutcome {
-        if let Some(tracker) = self.active.get(subagent_id) {
-            Self::cancel_tracker(tracker);
+        if self.active.contains_key(subagent_id) {
+            self.mark_explicitly_killed(subagent_id);
+            if let Some(tracker) = self.active.get(subagent_id) {
+                Self::cancel_tracker(tracker);
+            }
             return SubagentCancelOutcome::Cancelled;
         }
         if let Some(pending) = self.pending.get(subagent_id) {

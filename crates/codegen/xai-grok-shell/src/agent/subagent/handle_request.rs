@@ -1595,17 +1595,130 @@ pub(crate) async fn handle_subagent_request(
             }
         }
     };
-    if let Some(trace_gcs_config) = gcs_upload_ctx
-        .upload_method
-        .as_ref()
-        .map(|method| crate::session::repo_changes::TraceExportConfig {
-            bucket_url: gcs_upload_ctx.bucket_url.clone(),
-            service_account_key: None,
-            prefix_dir: None,
-            gcs_prefix: Some(format!("{}/turn_0", child_session_id.0)),
-            absolute_paths: false,
-            archive_name_override: None,
-            upload_method: method.clone(),
+    // ── Terminalize BEFORE best-effort I/O ──────────────────────────────
+    // A hung child (stuck tool / dead actor) can leave CopyFile oneshots
+    // forever-pending. Historically we awaited GCS / session-copy *before*
+    // SubagentFinished, so failed/cancelled kids stayed "running" in the
+    // pager and cancel looked broken. Publish the terminal state first.
+    let persisted_output_dir = persist_subagent_output(&subagent_meta_dir, &result);
+    persist_subagent_completion(&subagent_meta_dir, &result, &gcs_upload_ctx);
+    let final_status = result.status().to_string();
+    let snapshot_dispose_enabled = ctx.resolve_subagent_worktree_snapshot_enabled();
+    // Avoid unbounded waits on a hung child's chat-state for cancel/fail paths.
+    let telemetry_tokens = if result.cancelled {
+        0
+    } else if result.tool_calls > 0 || result.success {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            child_handle.chat_state_handle.get_total_tokens(),
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(_) => {
+                tracing::warn!(
+                    subagent_id = %request.id,
+                    "subagent token readout timed out; finishing without usage"
+                );
+                0
+            }
+        }
+    } else {
+        0
+    };
+    let (block_waited, explicitly_killed) = {
+        let mut coord = coordinator.borrow_mut();
+        (
+            coord.block_wait_delivered_or_live(&request.id),
+            coord.is_explicitly_killed(&request.id),
+        )
+    };
+    let will_wake = should_auto_wake_subagent(
+        request.run_in_background,
+        result.cancelled,
+        ctx.auto_wake_enabled,
+        block_waited,
+        explicitly_killed,
+        ctx.goal_loop_active.load(std::sync::atomic::Ordering::Relaxed),
+        ctx.parent_cmd_tx.is_some(),
+    );
+    let outcome = if result.success {
+        xai_grok_telemetry::events::Outcome::Completed
+    } else if result.cancelled {
+        xai_grok_telemetry::events::Outcome::Cancelled
+    } else {
+        xai_grok_telemetry::events::Outcome::Error
+    };
+    xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SubagentCompleted {
+        subagent_id: request.id.clone(),
+        parent_session_id: request.parent_session_id.clone(),
+        outcome,
+        duration_ms: result.duration_ms,
+        tool_calls: result.tool_calls,
+        tokens_used: if telemetry_tokens > 0 {
+            Some(telemetry_tokens)
+        } else {
+            None
+        },
+    });
+    emit_subagent_notification(
+        gateway,
+        &ctx.parent_session_id,
+        SessionUpdate::SubagentFinished {
+            subagent_id: request.id.clone(),
+            child_session_id: result.child_session_id.clone(),
+            status: result.status().to_string(),
+            error: result.error.clone(),
+            tool_calls: result.tool_calls,
+            turns: result.turns,
+            duration_ms: result.duration_ms,
+            tokens_used: telemetry_tokens,
+            output: if result.success {
+                Some(result.output.to_string())
+            } else {
+                None
+            },
+            will_wake,
+        },
+        ctx.parent_cmd_tx.as_ref(),
+    );
+    coordinator.borrow_mut().move_to_completed(
+        &request.id,
+        request.description.clone(),
+        request.subagent_type.clone(),
+        result.clone(),
+        persisted_output_dir,
+    );
+    // Unblock the parent await (heavy council / spawn_and_wait) immediately.
+    if let Some(tx) = result_tx.take() {
+        let _ = tx.send(result.clone());
+    }
+    if will_wake {
+        inject_subagent_completed_prompt(
+            &request.id,
+            &result,
+            &request,
+            &ctx.task_completion_reservations,
+            ctx.parent_cmd_tx.as_ref(),
+            &ctx.task_output_tool_name,
+            &ctx.synthetic_trace_tx,
+        );
+    }
+
+    // ── Best-effort cleanup / uploads (must not gate terminal status) ──
+    // Skip cloud trace uploads on cancel — child may be wedged and every
+    // oneshot can hang; finish already published above.
+    if !result.cancelled
+        && let Some(trace_gcs_config) = gcs_upload_ctx.upload_method.as_ref().map(|method| {
+            crate::session::repo_changes::TraceExportConfig {
+                bucket_url: gcs_upload_ctx.bucket_url.clone(),
+                service_account_key: None,
+                prefix_dir: None,
+                gcs_prefix: Some(format!("{}/turn_0", child_session_id.0)),
+                absolute_paths: false,
+                archive_name_override: None,
+                upload_method: method.clone(),
+            }
         })
     {
         let (copy_tx, session_copy_rx) = tokio::sync::oneshot::channel();
@@ -1623,28 +1736,29 @@ pub(crate) async fn handle_subagent_request(
                 })
                 .is_ok()
             {
-                rx.await.ok().flatten()
+                match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                    Ok(Ok(msgs)) => msgs,
+                    _ => None,
+                }
             } else {
                 None
             }
         };
         let streaming_partial = crate::upload::turn::take_streaming_partial(
-                &child_handle.cmd_tx,
-                child_prompt_id.clone(),
-                result.success,
-                gcs_upload_ctx.model_id.clone(),
-            )
-            .await
-            .map(|mut cap| {
-                cap.reason = Some(
-                    if result.cancelled {
-                        "subagent_cancel".to_string()
-                    } else {
-                        "subagent_non_completed".to_string()
-                    },
-                );
-                cap
+            &child_handle.cmd_tx,
+            child_prompt_id.clone(),
+            result.success,
+            gcs_upload_ctx.model_id.clone(),
+        )
+        .await
+        .map(|mut cap| {
+            cap.reason = Some(if result.success {
+                "subagent_completed".to_string()
+            } else {
+                "subagent_non_completed".to_string()
             });
+            cap
+        });
         let mut permission_events = Vec::new();
         while let Ok(event) = permission_rx.try_recv() {
             permission_events.push(event);
@@ -1663,32 +1777,32 @@ pub(crate) async fn handle_subagent_request(
         if let Ok(prompt_bytes) = std::fs::read(session_dir.join("system_prompt.txt")) {
             let gcs_path = format!("{}/system_prompt.txt", child_session_id.0);
             crate::upload::trace::upload_trace_artifact(
-                    &trace_ctx,
-                    &prompt_bytes,
-                    &gcs_path,
-                    "text/plain",
-                    "system_prompt",
-                )
-                .await;
+                &trace_ctx,
+                &prompt_bytes,
+                &gcs_path,
+                "text/plain",
+                "system_prompt",
+            )
+            .await;
         }
         if let Ok(ctx_bytes) = std::fs::read(session_dir.join("prompt_context.json")) {
             let gcs_path = format!("{}/prompt_context.json", child_session_id.0);
             crate::upload::trace::upload_trace_artifact(
-                    &trace_ctx,
-                    &ctx_bytes,
-                    &gcs_path,
-                    "application/json",
-                    "prompt_context",
-                )
-                .await;
-        }
-        upload_session_state(
                 &trace_ctx,
-                "before",
-                before_copy_rx,
-                crate::upload::turn::UploadWait::Confirm,
+                &ctx_bytes,
+                &gcs_path,
+                "application/json",
+                "prompt_context",
             )
             .await;
+        }
+        upload_session_state(
+            &trace_ctx,
+            "before",
+            before_copy_rx,
+            crate::upload::turn::UploadWait::Confirm,
+        )
+        .await;
         let subagent_auth = ctx.auth_manager.current();
         let metadata = PromptMetadata {
             schema_version: GCS_SCHEMA_VERSION.to_string(),
@@ -1724,11 +1838,16 @@ pub(crate) async fn handle_subagent_request(
             upload_config(&trace_ctx, agent_config).await;
         }
         crate::upload::config_files::upload_config_files(&trace_ctx).await;
-        let resolved_model = child_handle
-            .get_model_metadata()
-            .await
-            .resolved_model_id
-            .or_else(|| gcs_upload_ctx.model_id.clone());
+        let resolved_model = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            child_handle.get_model_metadata(),
+        )
+        .await
+        {
+            Ok(meta) => meta.resolved_model_id,
+            Err(_) => None,
+        }
+        .or_else(|| gcs_upload_ctx.model_id.clone());
         let turn_result_meta = TurnResultMetadata {
             schema_version: "1",
             request_id: child_prompt_id,
@@ -1742,77 +1861,83 @@ pub(crate) async fn handle_subagent_request(
             finished_at: chrono::Utc::now().to_rfc3339(),
             signals: None,
             turn_delta: None,
-            start_prompt_mode: Some(
-                crate::session::plan_mode::PromptMode::Agent.to_string(),
-            ),
-            end_prompt_mode: Some(
-                crate::session::plan_mode::PromptMode::Agent.to_string(),
-            ),
+            start_prompt_mode: Some(crate::session::plan_mode::PromptMode::Agent.to_string()),
+            end_prompt_mode: Some(crate::session::plan_mode::PromptMode::Agent.to_string()),
             resolved_model,
             subagents_spawned: vec![],
         };
         upload_turn_result(
-                &trace_ctx,
-                &turn_result_meta,
-                crate::upload::turn::UploadWait::Confirm,
-            )
-            .await;
+            &trace_ctx,
+            &turn_result_meta,
+            crate::upload::turn::UploadWait::Confirm,
+        )
+        .await;
         match complete_prompt_trace(
-                trace_ctx,
-                permission_events,
-                session_copy_rx,
-                turn_messages,
-                streaming_partial,
-                crate::upload::turn::UploadWait::Confirm,
-            )
-            .await
+            trace_ctx,
+            permission_events,
+            session_copy_rx,
+            turn_messages,
+            streaming_partial,
+            crate::upload::turn::UploadWait::Confirm,
+        )
+        .await
         {
             Ok(_) => {
                 tracing::debug!(
-                    subagent_id = % request.id, child_session_id = % child_session_id.0,
+                    subagent_id = %request.id,
+                    child_session_id = %child_session_id.0,
                     "Subagent trace artifacts uploaded"
                 );
             }
             Err(e) => {
                 tracing::warn!(
-                    subagent_id = % request.id, error = % e,
+                    subagent_id = %request.id,
+                    error = %e,
                     "Subagent trace upload failed (non-fatal)"
                 );
             }
         }
-    }
-    let persisted_output_dir = persist_subagent_output(&subagent_meta_dir, &result);
-    persist_subagent_completion(&subagent_meta_dir, &result, &gcs_upload_ctx);
-    let final_status = result.status().to_string();
-    let snapshot_dispose_enabled = ctx.resolve_subagent_worktree_snapshot_enabled();
-    let telemetry_tokens = if result.tool_calls > 0 || result.success {
-        child_handle.chat_state_handle.get_total_tokens().await
     } else {
-        0
-    };
-    let (subagent_usage_by_model, subagent_usage_incomplete) = match child_handle
-        .chat_state_handle
-        .try_get_session_usage()
+        // Drop the pre-prompt copy oneshot so a wedged child can't keep it alive.
+        drop(before_copy_rx);
+        // Drain leftover permission events so the channel doesn't warn on drop.
+        while permission_rx.try_recv().is_ok() {}
+    }
+
+    // Usage fold — best-effort; don't block forever on a hung child.
+    let (subagent_usage_by_model, subagent_usage_incomplete) =
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            child_handle.chat_state_handle.try_get_session_usage(),
+        )
         .await
-    {
-        Ok(u) => (Some(u.by_model.into_iter().collect::<Vec<_>>()), u.incomplete),
-        Err(()) => (None, true),
-    };
+        {
+            Ok(Ok(u)) => (
+                Some(u.by_model.into_iter().collect::<Vec<_>>()),
+                u.incomplete,
+            ),
+            Ok(Err(())) | Err(_) => (None, true),
+        };
     let fold_acked = match subagent_usage_by_model {
         None => false,
         Some(ref by_model) if by_model.is_empty() && !subagent_usage_incomplete => true,
         Some(by_model) => {
             if let Some(cmd_tx) = ctx.parent_cmd_tx.as_ref() {
                 let (respond_to, ack) = tokio::sync::oneshot::channel();
-                match cmd_tx
-                    .send(crate::session::commands::SessionCommand::RecordSubagentUsage {
+                match cmd_tx.send(
+                    crate::session::commands::SessionCommand::RecordSubagentUsage {
                         by_model,
                         parent_prompt_id: request.parent_prompt_id.clone(),
                         incomplete: subagent_usage_incomplete,
                         respond_to,
-                    })
-                {
-                    Ok(()) => ack.await.is_ok(),
+                    },
+                ) {
+                    Ok(()) => {
+                        matches!(
+                            tokio::time::timeout(std::time::Duration::from_secs(2), ack).await,
+                            Ok(Ok(()))
+                        )
+                    }
                     Err(_) => false,
                 }
             } else {
@@ -1822,7 +1947,8 @@ pub(crate) async fn handle_subagent_request(
     };
     if !fold_acked {
         tracing::warn!(
-            subagent_id = % request.id, parent_prompt_id = ? request.parent_prompt_id,
+            subagent_id = %request.id,
+            parent_prompt_id = ?request.parent_prompt_id,
             "subagent usage not applied; parent bill marked incomplete"
         );
         let sticky_prompt = request
@@ -1832,33 +1958,20 @@ pub(crate) async fn handle_subagent_request(
         if let Some(cmd_tx) = ctx.parent_cmd_tx.as_ref() {
             let (respond_to, ack) = tokio::sync::oneshot::channel();
             if cmd_tx
-                .send(crate::session::commands::SessionCommand::MarkSubagentUsageNotApplied {
-                    parent_prompt_id: sticky_prompt,
-                    respond_to,
-                })
+                .send(
+                    crate::session::commands::SessionCommand::MarkSubagentUsageNotApplied {
+                        parent_prompt_id: sticky_prompt,
+                        respond_to,
+                    },
+                )
                 .is_ok()
             {
-                let _ = ack.await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ack).await;
             }
         } else if let Some(ref pid) = sticky_prompt {
             coordinator.borrow_mut().mark_subagent_usage_not_applied(pid);
         }
     }
-    let outcome = if result.success {
-        xai_grok_telemetry::events::Outcome::Completed
-    } else if result.cancelled {
-        xai_grok_telemetry::events::Outcome::Cancelled
-    } else {
-        xai_grok_telemetry::events::Outcome::Error
-    };
-    xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SubagentCompleted {
-        subagent_id: request.id.clone(),
-        parent_session_id: request.parent_session_id.clone(),
-        outcome,
-        duration_ms: result.duration_ms,
-        tool_calls: result.tool_calls,
-        tokens_used: if telemetry_tokens > 0 { Some(telemetry_tokens) } else { None },
-    });
     match (&ctx.parent_terminal_backend, &ctx.parent_notification_handle) {
         (Some(parent_tb), Some(parent_notif_handle)) => {
             if !request.surface_completion {
@@ -1868,36 +1981,36 @@ pub(crate) async fn handle_subagent_request(
                     .into_iter()
                     .filter(|t| {
                         !t.completed
-                            && t.owner_session_id.as_deref()
-                                == Some(&*child_session_id.0)
+                            && t.owner_session_id.as_deref() == Some(&*child_session_id.0)
                     })
                     .map(|t| t.task_id)
                     .collect();
                 if !reparented_task_ids.is_empty()
                     && let Some(cmd_tx) = ctx.parent_cmd_tx.as_ref()
                 {
-                    let _ = cmd_tx
-                        .send(SessionCommand::RecordGoalTurnTaskIds {
-                            task_ids: reparented_task_ids,
-                        });
+                    let _ = cmd_tx.send(SessionCommand::RecordGoalTurnTaskIds {
+                        task_ids: reparented_task_ids,
+                    });
                 }
             }
             let parent_backend_weak = std::sync::Arc::downgrade(parent_tb);
-            parent_tb
-                .reparent_notifications(
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                parent_tb.reparent_notifications(
                     &child_session_id.0,
                     &ctx.parent_session_id,
                     parent_notif_handle.clone(),
                     parent_backend_weak,
-                )
-                .await;
+                ),
+            )
+            .await;
         }
         (Some(_), None) | (None, Some(_)) => {
             tracing::warn!(
-                child_session_id = % child_session_id.0, parent_session_id = % ctx
-                .parent_session_id, has_terminal_backend = ctx.parent_terminal_backend
-                .is_some(), has_notification_handle = ctx.parent_notification_handle
-                .is_some(),
+                child_session_id = %child_session_id.0,
+                parent_session_id = %ctx.parent_session_id,
+                has_terminal_backend = ctx.parent_terminal_backend.is_some(),
+                has_notification_handle = ctx.parent_notification_handle.is_some(),
                 "skipping reparent_notifications: parent_terminal_backend and \
                  parent_notification_handle must both be Some"
             );
@@ -1905,19 +2018,19 @@ pub(crate) async fn handle_subagent_request(
         (None, None) => {}
     }
     let _ = child_handle.cmd_tx.send(SessionCommand::Shutdown);
-    ctx.workspace_ops.end_local_session(child_session_id.0.as_ref());
+    ctx.workspace_ops
+        .end_local_session(child_session_id.0.as_ref());
     let mut disposed_snapshot_ref: Option<String> = None;
-    let mut worktree_removed = false;
     if let Some(ref wt_path) = worktree_path {
         if snapshot_dispose_enabled {
             let ref_name = format!("refs/grok/subagents/{}", request.id);
             let source_repo = resolve_subagent_source_repo(&ctx);
             match crate::session::worktree::snapshot_subagent_worktree(
-                    wt_path,
-                    &source_repo,
-                    &ref_name,
-                )
-                .await
+                wt_path,
+                &source_repo,
+                &ref_name,
+            )
+            .await
             {
                 Ok(snapshot_ref) => {
                     let persisted = update_subagent_meta_snapshot_ref(
@@ -1927,107 +2040,51 @@ pub(crate) async fn handle_subagent_request(
                     );
                     if persisted {
                         disposed_snapshot_ref = Some(snapshot_ref);
-                        match crate::session::worktree::remove_subagent_worktree(wt_path)
-                            .await
-                        {
+                        match crate::session::worktree::remove_subagent_worktree(wt_path).await {
                             Ok(()) => {
-                                worktree_removed = true;
                                 tracing::info!(
-                                    subagent_id = % request.id, worktree_path = % wt_path
-                                    .display(), "snapshotted and removed subagent worktree"
+                                    subagent_id = %request.id,
+                                    worktree_path = %wt_path.display(),
+                                    "snapshotted and removed subagent worktree"
                                 );
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    subagent_id = % request.id, worktree_path = % wt_path
-                                    .display(), error = % e,
+                                    subagent_id = %request.id,
+                                    worktree_path = %wt_path.display(),
+                                    error = %e,
                                     "snapshotted subagent worktree but removal failed; ref persisted for resume"
                                 )
                             }
                         }
                     } else {
                         tracing::warn!(
-                            subagent_id = % request.id, worktree_path = % wt_path
-                            .display(),
+                            subagent_id = %request.id,
+                            worktree_path = %wt_path.display(),
                             "snapshot_ref not persisted; preserving worktree for resume"
                         );
                     }
                 }
                 Err(e) => {
                     tracing::warn!(
-                        subagent_id = % request.id, worktree_path = % wt_path.display(),
-                        error = % e,
+                        subagent_id = %request.id,
+                        worktree_path = %wt_path.display(),
+                        error = %e,
                         "Failed to snapshot subagent worktree; preserving for review"
                     );
                 }
             }
         } else {
             tracing::info!(
-                subagent_id = % request.id, worktree_path = % wt_path.display(),
+                subagent_id = %request.id,
+                worktree_path = %wt_path.display(),
                 "Worktree preserved for review"
             );
         }
     }
-    if worktree_removed {
-        result.worktree_path = None;
-    }
-    let (block_waited, explicitly_killed) = {
-        let mut coord = coordinator.borrow_mut();
-        (
-            coord.block_wait_delivered_or_live(&request.id),
-            coord.is_explicitly_killed(&request.id),
-        )
-    };
-    let will_wake = should_auto_wake_subagent(
-        request.run_in_background,
-        result.cancelled,
-        ctx.auto_wake_enabled,
-        block_waited,
-        explicitly_killed,
-        ctx.goal_loop_active.load(std::sync::atomic::Ordering::Relaxed),
-        ctx.parent_cmd_tx.is_some(),
-    );
-    emit_subagent_notification(
-        gateway,
-        &ctx.parent_session_id,
-        SessionUpdate::SubagentFinished {
-            subagent_id: request.id.clone(),
-            child_session_id: result.child_session_id.clone(),
-            status: result.status().to_string(),
-            error: result.error.clone(),
-            tool_calls: result.tool_calls,
-            turns: result.turns,
-            duration_ms: result.duration_ms,
-            tokens_used: telemetry_tokens,
-            output: if result.success { Some(result.output.to_string()) } else { None },
-            will_wake,
-        },
-        ctx.parent_cmd_tx.as_ref(),
-    );
-    coordinator
-        .borrow_mut()
-        .move_to_completed(
-            &request.id,
-            request.description.clone(),
-            request.subagent_type.clone(),
-            result.clone(),
-            persisted_output_dir,
-        );
     if let Some(snapshot_ref) = disposed_snapshot_ref {
-        coordinator.borrow_mut().set_completed_snapshot_ref(&request.id, snapshot_ref);
-    }
-    if will_wake {
-        inject_subagent_completed_prompt(
-            &request.id,
-            &result,
-            &request,
-            &ctx.task_completion_reservations,
-            ctx.parent_cmd_tx.as_ref(),
-            &ctx.task_output_tool_name,
-            &ctx.synthetic_trace_tx,
-        );
-    }
-    if let Some(tx) = result_tx.take() {
-        let _ = tx.send(result);
+        coordinator
+            .borrow_mut()
+            .set_completed_snapshot_ref(&request.id, snapshot_ref);
     }
 }
