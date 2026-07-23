@@ -283,18 +283,31 @@ impl SessionActor {
         }
         // Multi-agent effort modes: captain model + code-enforced workers
         // (Heavy/SH: council+RIT · Swarm: map→implement→verify).
+        // Skip when plan mode is on — plan mode needs the normal tool/reminder
+        // path (enter/exit_plan_mode). Swarm pipelines were short-circuiting
+        // the turn and making plan mode appear broken.
         if !origin.is_synthetic() && self.should_run_heavy_pipeline().await {
-            let user_text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
-                if let acp::ContentBlock::Text(t) = b {
-                    if !acc.is_empty() {
-                        acc.push('\n');
+            let plan_blocks_swarm = {
+                use crate::session::plan_mode::{PlanModeState, PromptMode};
+                let state = self.plan_mode.lock().state();
+                matches!(
+                    state,
+                    PlanModeState::Pending | PlanModeState::Active | PlanModeState::ExitPending
+                ) || matches!(prompt_mode, PromptMode::Plan)
+            };
+            if !plan_blocks_swarm {
+                let user_text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
+                    if let acp::ContentBlock::Text(t) = b {
+                        if !acc.is_empty() {
+                            acc.push('\n');
+                        }
+                        acc.push_str(&t.text);
                     }
-                    acc.push_str(&t.text);
+                    acc
+                });
+                if !user_text.trim().is_empty() {
+                    return self.run_heavy_pipeline(prompt_id, user_text.trim()).await;
                 }
-                acc
-            });
-            if !user_text.trim().is_empty() {
-                return self.run_heavy_pipeline(prompt_id, user_text.trim()).await;
             }
         }
         let slash_skills = self

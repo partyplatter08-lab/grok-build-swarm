@@ -33,11 +33,13 @@ const BOARD_HEARTBEAT: Duration = Duration::from_secs(20);
 /// Hard cap so a hung worker never floods the parent feed.
 const MAX_HEARTBEATS: u32 = 3;
 /// How often we sample child speech for live dialogue in the parent chat.
-const DIALOGUE_POLL: Duration = Duration::from_millis(450);
-/// Min new chars before we push a dialogue delta (avoids per-token spam).
-const DIALOGUE_MIN_DELTA: usize = 24;
+/// Snappy enough that speech appears as it streams, not only at the end.
+const DIALOGUE_POLL: Duration = Duration::from_millis(180);
+/// Min new chars before we push a dialogue delta (keeps feed moving without
+/// per-token spam). Lowered so partial sentences still stream live.
+const DIALOGUE_MIN_DELTA: usize = 6;
 /// Max chars of a single dialogue push (keep the feed readable).
-const DIALOGUE_MAX_CHUNK: usize = 360;
+const DIALOGUE_MAX_CHUNK: usize = 280;
 
 // ── Council (Heavy / Swarm Heavy) ───────────────────────────────────────────
 
@@ -259,7 +261,7 @@ impl SessionActor {
     ) -> PromptTurnResult {
         tracing::info!(session_id = %session_id, "swarm_pipeline: map→reduce start");
 
-        let open = self
+        if self
             .captain_speak(
                 CaptainPhase::OpenSwarm,
                 user_text,
@@ -267,10 +269,9 @@ impl SessionActor {
                 None,
                 1_000,
             )
-            .await;
-        if let Some(text) = open {
-            self.emit_agent_text(&text).await;
-        } else {
+            .await
+            .is_none()
+        {
             self.emit_agent_text(&format!(
                 "⬡ **SWARM** map→reduce — I'll fan out independent units, \
                  then implement + verify.\n\n**Goal:** {}",
@@ -330,7 +331,7 @@ impl SessionActor {
         }
         prior.push(("swarm-map".into(), map_digest));
 
-        let brief = self
+        let captain_direction = self
             .captain_speak(
                 CaptainPhase::AfterMap,
                 user_text,
@@ -338,11 +339,8 @@ impl SessionActor {
                 None,
                 1_400,
             )
-            .await;
-        if let Some(ref text) = brief {
-            self.emit_agent_text(text).await;
-        }
-        let captain_direction = brief.unwrap_or_default();
+            .await
+            .unwrap_or_default();
 
         // Wave 2 — implement (single writer)
         self.emit_agent_text("── **S2 fan-out · wave 2** · implement ──").await;
@@ -368,7 +366,7 @@ impl SessionActor {
         {
             Ok(r) => {
                 prior.push(("implement".into(), result_body(&Ok(r.clone()))));
-                let reaction = self
+                let _reaction = self
                     .captain_speak(
                         CaptainPhase::AfterStage {
                             stage: "implement",
@@ -380,9 +378,6 @@ impl SessionActor {
                         900,
                     )
                     .await;
-                if let Some(t) = reaction {
-                    self.emit_agent_text(&t).await;
-                }
             }
             Err(e) => {
                 prior.push(("implement".into(), format!("[error] {e}")));
@@ -420,7 +415,7 @@ impl SessionActor {
             }
         }
 
-        let final_answer = self
+        if self
             .captain_speak(
                 CaptainPhase::FinalSwarm,
                 user_text,
@@ -429,8 +424,15 @@ impl SessionActor {
                 4_096,
             )
             .await
-            .unwrap_or_else(|| synthesize_board_dump(user_text, &prior, "⬡ SWARM RESULT"));
-        self.emit_agent_text(&final_answer).await;
+            .is_none()
+        {
+            self.emit_agent_text(&synthesize_board_dump(
+                user_text,
+                &prior,
+                "⬡ SWARM RESULT",
+            ))
+            .await;
+        }
         commands::ok_end_turn(0, None)
     }
 
@@ -460,9 +462,7 @@ impl SessionActor {
         let open = self
             .captain_speak(CaptainPhase::OpenSwarmHeavy, user_text, &[], None, 1_200)
             .await;
-        if let Some(text) = open {
-            self.emit_agent_text(&text).await;
-        } else {
+        if open.is_none() {
             self.emit_agent_text(&format!(
                 "⬢ **SWARM HEAVY** — collaborative council first (they argue), \
                  then a swarm fan-out of workers, then verify.\n\n**Goal:** {}",
@@ -496,9 +496,7 @@ impl SessionActor {
                 2_000,
             )
             .await;
-        if let Some(ref text) = captain_brief {
-            self.emit_agent_text(text).await;
-        } else {
+        if captain_brief.is_none() {
             self.emit_agent_text(&format!(
                 "Council agreed/disputed:\n\n{board_index}\n\n\
                  → Swarm fan-out next (many workers on units)."
@@ -569,9 +567,6 @@ impl SessionActor {
                 1_400,
             )
             .await;
-        if let Some(ref text) = after_map {
-            self.emit_agent_text(text).await;
-        }
         let mut direction = after_map.unwrap_or(captain_direction);
 
         // ── S3 implement ────────────────────────────────────────────────
@@ -607,7 +602,7 @@ impl SessionActor {
                     )
                     .await
                 {
-                    self.emit_agent_text(&t).await;
+                    // already streamed into the parent feed
                     direction = t;
                 }
             }
@@ -686,7 +681,7 @@ impl SessionActor {
         }
         prior.push(("h2-verify-council".into(), h2_digest));
 
-        let final_answer = self
+        if self
             .captain_speak(
                 CaptainPhase::FinalSwarmHeavy,
                 user_text,
@@ -695,10 +690,15 @@ impl SessionActor {
                 4_096,
             )
             .await
-            .unwrap_or_else(|| {
-                synthesize_board_dump(user_text, &prior, "⬢ SWARM HEAVY RESULT")
-            });
-        self.emit_agent_text(&final_answer).await;
+            .is_none()
+        {
+            self.emit_agent_text(&synthesize_board_dump(
+                user_text,
+                &prior,
+                "⬢ SWARM HEAVY RESULT",
+            ))
+            .await;
+        }
         commands::ok_end_turn(0, None)
     }
 
@@ -722,9 +722,7 @@ impl SessionActor {
         let open = self
             .captain_speak(CaptainPhase::Open, user_text, &[], None, 1_200)
             .await;
-        if let Some(text) = open {
-            self.emit_agent_text(&text).await;
-        } else {
+        if open.is_none() {
             self.emit_agent_text(&format!(
                 "{}\n\nI'm the **captain** — a collaborative council (they argue), \
                  then research → implement → test.\n\n**Goal:** {}",
@@ -758,9 +756,7 @@ impl SessionActor {
                 1_800,
             )
             .await;
-        if let Some(ref text) = captain_brief {
-            self.emit_agent_text(text).await;
-        } else {
+        if captain_brief.is_none() {
             self.emit_agent_text(&format!(
                 "Council board (after debate):\n\n{board_index}\n\n→ Research → Implement → Test."
             ))
@@ -782,9 +778,7 @@ impl SessionActor {
                     700,
                 )
                 .await;
-            if let Some(text) = pre {
-                self.emit_agent_text(&text).await;
-            } else {
+            if pre.is_none() {
                 self.emit_agent_text(&format!(
                     "── **Phase {n}/3 · {}** ──",
                     stage.id_suffix
@@ -811,7 +805,7 @@ impl SessionActor {
                 Ok(result) => {
                     let out = result_body(&Ok(result));
                     prior.push((stage.id_suffix.to_string(), out.clone()));
-                    let reaction = self
+                    if let Some(text) = self
                         .captain_speak(
                             CaptainPhase::AfterStage {
                                 stage: stage.id_suffix,
@@ -822,9 +816,9 @@ impl SessionActor {
                             Some(&extract_stage_summary(&out)),
                             1_200,
                         )
-                        .await;
-                    if let Some(text) = reaction {
-                        self.emit_agent_text(&text).await;
+                        .await
+                    {
+                        // already streamed
                         captain_direction = text;
                     }
                 }
@@ -839,7 +833,7 @@ impl SessionActor {
             }
         }
 
-        let final_answer = self
+        if self
             .captain_speak(
                 CaptainPhase::Final,
                 user_text,
@@ -848,8 +842,15 @@ impl SessionActor {
                 4_096,
             )
             .await
-            .unwrap_or_else(|| synthesize_board_dump(user_text, &prior, "◈ HEAVY RESULT"));
-        self.emit_agent_text(&final_answer).await;
+            .is_none()
+        {
+            self.emit_agent_text(&synthesize_board_dump(
+                user_text,
+                &prior,
+                "◈ HEAVY RESULT",
+            ))
+            .await;
+        }
         commands::ok_end_turn(0, None)
     }
 
@@ -1016,6 +1017,25 @@ impl SessionActor {
         .await;
     }
 
+    /// Stream a text delta into the parent feed without extra blank lines.
+    /// Used for live captain / speaker streaming.
+    async fn emit_agent_text_raw(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.send_update(
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                acp::ContentBlock::Text(acp::TextContent::new(text.to_string())),
+            )),
+            None,
+        )
+        .await;
+    }
+
+    /// Captain model turn — **streams tokens into the parent feed** as they
+    /// arrive (no more collect-then-dump). Returns the full text for pipeline
+    /// state (briefs / handoffs). Callers must **not** re-emit the returned
+    /// text; it is already on the feed.
     async fn captain_speak(
         &self,
         phase: CaptainPhase<'_>,
@@ -1041,7 +1061,14 @@ impl SessionActor {
             return None;
         }
 
-        use crate::sampling::{ConversationItem, ConversationRequest};
+        use crate::sampling::{
+            ApiBackend, ConversationItem, ConversationRequest, SamplingChannel, SamplingEvent,
+        };
+        use futures::StreamExt;
+        use xai_grok_sampler::{
+            RequestId, stream_chat_completions, stream_messages, stream_responses,
+        };
+
         let request = ConversationRequest::from_items(vec![
             ConversationItem::system(phase.system_prompt()),
             ConversationItem::user(phase.user_prompt(user_text, prior, extra)),
@@ -1049,20 +1076,130 @@ impl SessionActor {
         .with_model(model)
         .with_max_output_tokens(max_tokens);
 
-        match sampling_client.conversation_collect(request).await {
-            Ok(response) => {
-                let t = response.assistant_text();
-                let trimmed = t.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
+        let request_id = RequestId::random();
+        let idle_timeout = Duration::from_secs(180);
+
+        // Open a live stream and push ChannelToken text to the parent as it lands.
+        let stream_result = match sampling_client.api_backend() {
+            ApiBackend::ChatCompletions => {
+                match sampling_client.conversation_stream(request).await {
+                    Ok((raw, meta)) => {
+                        Ok(Box::pin(stream_chat_completions(
+                            raw,
+                            meta,
+                            request_id,
+                            idle_timeout,
+                        ))
+                            as std::pin::Pin<
+                                Box<dyn futures::Stream<Item = SamplingEvent> + Send>,
+                            >)
+                    }
+                    Err(e) => Err(e),
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, phase = %phase, "captain call failed");
-                None
+            ApiBackend::Responses => {
+                match sampling_client
+                    .conversation_stream_responses(request)
+                    .await
+                {
+                    Ok((raw, meta, doom_loop)) => Ok(Box::pin(stream_responses(
+                        raw,
+                        meta,
+                        request_id,
+                        idle_timeout,
+                        doom_loop,
+                    ))
+                        as std::pin::Pin<
+                            Box<dyn futures::Stream<Item = SamplingEvent> + Send>,
+                        >),
+                    Err(e) => Err(e),
+                }
             }
+            ApiBackend::Messages => {
+                match sampling_client.conversation_stream_messages(request).await {
+                    Ok((raw, meta)) => Ok(Box::pin(stream_messages(
+                        raw,
+                        meta,
+                        request_id,
+                        idle_timeout,
+                    ))
+                        as std::pin::Pin<
+                            Box<dyn futures::Stream<Item = SamplingEvent> + Send>,
+                        >),
+                    Err(e) => Err(e),
+                }
+            }
+        };
+
+        let mut stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, phase = %phase, "captain stream open failed");
+                return None;
+            }
+        };
+
+        let mut full = String::new();
+        // Prefix so the feed labels captain speech like worker speakers.
+        let header = format!("▸ **Captain ({phase}):** ");
+        self.emit_agent_text_raw(&header).await;
+        let mut pending = String::new();
+        // Flush buffered tokens every few chars / on whitespace for smooth UI.
+        const FLUSH_AT: usize = 12;
+
+        while let Some(ev) = stream.next().await {
+            match ev {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Text,
+                    text,
+                    ..
+                } => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    full.push_str(&text);
+                    pending.push_str(&text);
+                    let flush = pending.len() >= FLUSH_AT
+                        || pending.contains('\n')
+                        || pending.ends_with(' ')
+                        || pending.ends_with('.')
+                        || pending.ends_with('!')
+                        || pending.ends_with('?');
+                    if flush {
+                        self.emit_agent_text_raw(&pending).await;
+                        pending.clear();
+                    }
+                }
+                SamplingEvent::Failed { error, .. } => {
+                    tracing::warn!(
+                        phase = %phase,
+                        message = %error.message,
+                        "captain stream failed"
+                    );
+                    if !pending.is_empty() {
+                        self.emit_agent_text_raw(&pending).await;
+                        pending.clear();
+                    }
+                    break;
+                }
+                SamplingEvent::Completed { .. } => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if !pending.is_empty() {
+            self.emit_agent_text_raw(&pending).await;
+        }
+        // Trailing blank line after a captain turn so the next board/speaker
+        // does not glue to the last token.
+        self.emit_agent_text_raw("\n\n").await;
+
+        let trimmed = full.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
         }
     }
 }
@@ -1208,16 +1345,18 @@ async fn emit_dialogue_deltas(actor: &SessionActor, state: &mut DialogueState) {
         if full.is_empty() {
             continue;
         }
+        // Track by char count so UTF-8 never panics on mid-char slices.
         let already = state.emitted_len.get(&label).copied().unwrap_or(0);
-        if full.len() <= already {
+        let full_chars: Vec<char> = full.chars().collect();
+        if full_chars.len() <= already {
             continue;
         }
-        let mut delta = full[already..].to_string();
-        if delta.len() > DIALOGUE_MAX_CHUNK {
+        let mut delta: String = full_chars[already..].iter().collect();
+        if delta.chars().count() > DIALOGUE_MAX_CHUNK {
             let cut = delta
                 .char_indices()
                 .take_while(|(i, _)| *i < DIALOGUE_MAX_CHUNK)
-                .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '\n'))
+                .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '\n' | ' '))
                 .map(|(i, _)| i + 1)
                 .last()
                 .unwrap_or(DIALOGUE_MAX_CHUNK);
@@ -1228,6 +1367,7 @@ async fn emit_dialogue_deltas(actor: &SessionActor, state: &mut DialogueState) {
             && !delta.ends_with('.')
             && !delta.ends_with('!')
             && !delta.ends_with('?')
+            && !delta.ends_with(' ')
         {
             continue;
         }
@@ -1243,8 +1383,9 @@ async fn emit_dialogue_deltas(actor: &SessionActor, state: &mut DialogueState) {
         if switch {
             state.current_speaker = Some(label.clone());
         }
-        actor.emit_agent_text(&piece).await;
-        let new_len = already + delta.len();
+        // Stream without extra blank-line padding so speech feels continuous.
+        actor.emit_agent_text_raw(&piece).await;
+        let new_len = already + delta.chars().count();
         state.emitted_len.insert(label, new_len);
     }
 }
@@ -1618,10 +1759,12 @@ async fn force_flush_dialogue(actor: &SessionActor, state: &mut DialogueState) {
         };
         let full = read_child_spoken_text(&dir);
         let already = state.emitted_len.get(&label).copied().unwrap_or(0);
-        if full.len() <= already {
+        let full_chars: Vec<char> = full.chars().collect();
+        if full_chars.len() <= already {
             continue;
         }
-        let delta = full[already..].trim();
+        let delta: String = full_chars[already..].iter().collect();
+        let delta = delta.trim();
         if delta.is_empty() {
             continue;
         }
@@ -1633,8 +1776,8 @@ async fn force_flush_dialogue(actor: &SessionActor, state: &mut DialogueState) {
         if switch {
             state.current_speaker = Some(label.clone());
         }
-        actor.emit_agent_text(&piece).await;
-        state.emitted_len.insert(label, full.len());
+        actor.emit_agent_text_raw(&piece).await;
+        state.emitted_len.insert(label, full_chars.len());
     }
 }
 
