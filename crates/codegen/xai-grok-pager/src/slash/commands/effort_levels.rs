@@ -34,7 +34,9 @@ pub(crate) fn effort_display_label(
     if let Some(id) = option_id {
         let mode = OrchestrationMode::from_option_id(id);
         if mode.is_multi_agent() {
-            return Some(mode.label().to_string());
+            // Glyph + human label for footer / chips (e.g. "◈ Heavy").
+            // mark() is symbol-only — never concatenate brand()+label().
+            return Some(format!("{} {}", mode.mark(), mode.label()));
         }
         if let Some(opt) = legacy_effort_options()
             .into_iter()

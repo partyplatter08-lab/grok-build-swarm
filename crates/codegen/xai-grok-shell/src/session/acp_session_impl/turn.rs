@@ -281,8 +281,8 @@ impl SessionActor {
                 .handle_direct_bash_command(prompt_id, bash_command, &prompt_blocks)
                 .await;
         }
-        // Heavy / Swarm Heavy: captain model (talks + judges) + real subagent
-        // workers (parallel council, then Research → Implement → Test).
+        // Multi-agent effort modes: captain model + code-enforced workers
+        // (Heavy/SH: council+RIT · Swarm: map→implement→verify).
         if !origin.is_synthetic() && self.should_run_heavy_pipeline().await {
             let user_text = prompt_blocks.iter().fold(String::new(), |mut acc, b| {
                 if let acp::ContentBlock::Text(t) = b {
