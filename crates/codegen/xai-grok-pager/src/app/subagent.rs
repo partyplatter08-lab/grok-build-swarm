@@ -377,17 +377,48 @@ fn parse_tag_prefix(description: &str) -> (Option<&str>, &str) {
     }
     (None, description)
 }
+/// True for stock types that multi-agent pipelines reuse for many workers
+/// (`explore` / `plan` / `general-purpose`). When a description carries a
+/// real role tag like `[Council/Analyst]`, that tag is far more useful than
+/// "Explore" in the tasks pane and title bar.
+fn is_generic_subagent_type(subagent_type: &str) -> bool {
+    matches!(
+        subagent_type,
+        "general-purpose" | "explore" | "plan" | "general" | ""
+    )
+}
+
+/// Prefer the last path segment of a multi-agent description tag so the
+/// top bar shows **Analyst** rather than **Council/Analyst** or **SH/H1·Skeptic**.
+///
+/// Examples:
+/// - `Council/Analyst` → `Analyst`
+/// - `SH/H1·Skeptic` → `Skeptic`
+/// - `Swarm/u-3` → `u-3`
+/// - `diagnose` → `diagnose`
+fn display_role_from_tag(tag: &str) -> &str {
+    let t = tag.trim();
+    // Split on · first (swarm-heavy chrome), then /
+    let after_dot = t.rsplit('·').next().unwrap_or(t).trim();
+    let after_slash = after_dot.rsplit('/').next().unwrap_or(after_dot).trim();
+    if after_slash.is_empty() {
+        t
+    } else {
+        after_slash
+    }
+}
+
 /// Single consolidated label + display description for a subagent row.
 ///
 /// Precedence for the label (highest first):
 /// 1. `persona` — semantic, parent-supplied at spawn time.
 /// 2. `role`    — config-defined preset.
-/// 3. `subagent_type` (only when **not** `general-purpose`) — `explore`,
-///    `plan`, or any custom type carries real signal.
-/// 4. `[tag]` parsed from the description — fallback when nothing above
-///    identifies the agent and `subagent_type` is the meaningless default.
-/// 5. `"general"` — final fallback when `subagent_type == "general-purpose"`
-///    and no persona / role / tag is present.
+/// 3. `[tag]` from the description — multi-agent pipelines stamp roles here
+///    (`[Council/Analyst]`, `[Swarm/diagnose]`, …). Prefer this over stock
+///    types so the tasks pane / title bar don't all say "Explore".
+/// 4. `subagent_type` when it is **not** a generic type (`explore`/`plan`/
+///    `general-purpose`) — custom agent types still win when no tag is set.
+/// 5. `"general"` — final fallback.
 ///
 /// The returned label has its first character capitalized for display
 /// (e.g. `explore` → `Explore`, `implementer` → `Implementer`). Personas,
@@ -413,10 +444,14 @@ pub(crate) fn format_subagent_label(info: &SubagentInfo) -> (String, String) {
         .filter(|s| !s.is_empty())
     {
         r.to_string()
-    } else if info.subagent_type.as_ref() != "general-purpose" {
-        format_type_label(&info.subagent_type).to_string()
     } else if let Some(tag) = tag {
-        tag.to_string()
+        display_role_from_tag(tag).to_string()
+    } else if !is_generic_subagent_type(info.subagent_type.as_ref()) {
+        format_type_label(&info.subagent_type).to_string()
+    } else if !info.subagent_type.is_empty() && info.subagent_type.as_ref() != "general-purpose" {
+        // Generic type with no tag: still show Explore/Plan rather than
+        // "general" so plain explore spawns stay identifiable.
+        format_type_label(&info.subagent_type).to_string()
     } else {
         "general".to_string()
     };
@@ -867,12 +902,34 @@ mod tests {
         assert_eq!(label, "Analyst");
     }
     #[test]
-    fn label_uses_subagent_type_when_meaningful() {
+    fn label_prefers_description_tag_over_generic_explore_type() {
+        // Multi-agent pipelines stamp roles in the description; explore/plan
+        // types are reused for many workers and must not win the label.
         let mut info = make_info();
         info.subagent_type = "explore".into();
-        info.description = "[deep-dive] find auth code".into();
+        info.description = "[Council/Analyst] review the auth paths".into();
+        let (label, desc) = format_subagent_label(&info);
+        assert_eq!(label, "Analyst");
+        assert_eq!(desc, "review the auth paths");
+    }
+
+    #[test]
+    fn label_uses_subagent_type_when_no_tag() {
+        let mut info = make_info();
+        info.subagent_type = "explore".into();
+        info.description = "find auth code".into();
         let (label, desc) = format_subagent_label(&info);
         assert_eq!(label, "Explore");
+        assert_eq!(desc, "find auth code");
+    }
+
+    #[test]
+    fn label_custom_type_without_tag_still_uses_type() {
+        let mut info = make_info();
+        info.subagent_type = "deep-dive".into();
+        info.description = "find auth code".into();
+        let (label, desc) = format_subagent_label(&info);
+        assert_eq!(label, "Deep-dive");
         assert_eq!(desc, "find auth code");
     }
     #[test]

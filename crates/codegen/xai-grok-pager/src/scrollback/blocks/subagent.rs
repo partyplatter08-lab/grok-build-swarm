@@ -214,6 +214,8 @@ impl BlockContent for SubagentBlock {
         if orch_mode.is_multi_agent() && w >= 28 {
             // Role label: persona → role → type → [tag] from description.
             let (tag, clean_desc) = parse_desc_tag(&self.description);
+            // Prefer description tag (Council/Analyst, Swarm/diagnose, …) over
+            // stock types like "explore" so cards match the tasks pane / chat.
             let role = self
                 .persona
                 .as_deref()
@@ -227,16 +229,37 @@ impl BlockContent for SubagentBlock {
                     }
                 })
                 .or_else(|| {
-                    if self.subagent_type != "general-purpose" && !self.subagent_type.is_empty() {
-                        Some(crate::app::subagent::format_type_label(&self.subagent_type).to_string())
+                    tag.map(|t| {
+                        // Last segment after / or · — "Council/Analyst" → "Analyst"
+                        let short = t
+                            .rsplit(['·', '/'])
+                            .next()
+                            .unwrap_or(t)
+                            .trim();
+                        let mut c = short.chars();
+                        match c.next() {
+                            Some(ch) => ch.to_uppercase().chain(c).collect(),
+                            None => short.to_string(),
+                        }
+                    })
+                })
+                .or_else(|| {
+                    if self.subagent_type != "general-purpose"
+                        && self.subagent_type != "explore"
+                        && self.subagent_type != "plan"
+                        && !self.subagent_type.is_empty()
+                    {
+                        Some(
+                            crate::app::subagent::format_type_label(&self.subagent_type)
+                                .to_string(),
+                        )
+                    } else if !self.subagent_type.is_empty() {
+                        Some(
+                            crate::app::subagent::format_type_label(&self.subagent_type)
+                                .to_string(),
+                        )
                     } else {
-                        tag.map(|t| {
-                            let mut c = t.chars();
-                            match c.next() {
-                                Some(ch) => ch.to_uppercase().chain(c).collect(),
-                                None => t.to_string(),
-                            }
-                        })
+                        None
                     }
                 })
                 .unwrap_or_else(|| "Worker".to_string());

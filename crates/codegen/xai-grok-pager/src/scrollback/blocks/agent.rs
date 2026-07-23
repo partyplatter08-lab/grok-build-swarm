@@ -1,7 +1,13 @@
 //! AgentMessageBlock - displays agent responses with markdown.
 
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+
 use crate::scrollback::block::BlockContent;
-use crate::scrollback::types::{AccentStyle, BlockContext, BlockOutput};
+use crate::scrollback::types::{
+    AccentStyle, BlockContext, BlockLine, BlockOutput, DisplayMode,
+};
+use crate::theme::Theme;
 
 use super::markdown_content::MarkdownContent;
 use super::mermaid_content::{self, MermaidContent};
@@ -115,6 +121,59 @@ impl AgentMessageBlock {
             self.content.rendered_plain_text()
         }
     }
+
+    /// Multi-agent speaker turns (`▸ **Analyst:** …`) or council boards —
+    /// these dump a lot of text and should start collapsed.
+    pub fn is_multi_agent_argument(&self) -> bool {
+        let t = self.content.text();
+        t.contains("▸ **")
+            || t.contains("▸**")
+            || t.contains("### ◈")
+            || t.contains("### ⬡")
+            || t.contains("### ⬢")
+            || t.contains("Live council feed")
+            || t.contains("**Live council feed**")
+    }
+
+    /// Collapsed one-line summary for a multi-agent argument block.
+    fn multi_agent_collapsed_header(&self) -> String {
+        let t = self.content.text();
+        // Collect unique speaker labels from `▸ **Name:**` markers.
+        let mut speakers: Vec<String> = Vec::new();
+        for line in t.lines() {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix("▸ **")
+                .or_else(|| line.strip_prefix("▸**"));
+            if let Some(rest) = rest
+                && let Some(end) = rest.find(":**")
+            {
+                let name = rest[..end].trim();
+                if !name.is_empty() && !speakers.iter().any(|s| s == name) {
+                    speakers.push(name.to_string());
+                }
+            }
+        }
+        let chars = t.chars().count();
+        let size = if chars >= 1000 {
+            format!("{}k chars", (chars + 500) / 1000)
+        } else {
+            format!("{chars} chars")
+        };
+        if speakers.is_empty() {
+            format!("▸ Multi-agent output · {size}  (enter to expand)")
+        } else if speakers.len() == 1 {
+            format!("▸ {} · {size}  (enter to expand)", speakers[0])
+        } else if speakers.len() <= 4 {
+            format!("▸ {} · {size}  (enter to expand)", speakers.join(" · "))
+        } else {
+            format!(
+                "▸ {} +{} more · {size}  (enter to expand)",
+                speakers[..3].join(" · "),
+                speakers.len() - 3
+            )
+        }
+    }
 }
 
 impl AgentMessageBlock {
@@ -168,6 +227,44 @@ impl AgentMessageBlock {
 
 impl BlockContent for AgentMessageBlock {
     fn output(&self, ctx: &BlockContext) -> BlockOutput {
+        // Multi-agent speaker dumps: collapse to a one-line summary by default.
+        if self.is_multi_agent_argument() && ctx.mode == DisplayMode::Collapsed {
+            let theme = Theme::current();
+            let header = self.multi_agent_collapsed_header();
+            let line = Line::from(Span::styled(
+                crate::render::line_utils::truncate_str(&header, ctx.width as usize),
+                Style::default()
+                    .fg(theme.accent_running)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            return BlockOutput {
+                lines: vec![BlockLine::separator(line)],
+            };
+        }
+        // Truncated: header + last few lines of the argument.
+        if self.is_multi_agent_argument() && ctx.mode == DisplayMode::Truncated {
+            let theme = Theme::current();
+            let header = self.multi_agent_collapsed_header().replace(
+                "(enter to expand)",
+                "(streaming… enter to expand)",
+            );
+            let mut lines = vec![BlockLine::separator(Line::from(Span::styled(
+                crate::render::line_utils::truncate_str(&header, ctx.width as usize),
+                Style::default().fg(theme.gray).add_modifier(Modifier::BOLD),
+            )))];
+            let full = self.content.output(ctx.width as usize);
+            let keep = 3.min(full.lines.len());
+            if full.lines.len() > keep {
+                lines.push(BlockLine::separator(Line::from(Span::styled(
+                    "…",
+                    Style::default().fg(theme.gray),
+                ))));
+            }
+            let start = full.lines.len().saturating_sub(keep);
+            lines.extend(full.lines.into_iter().skip(start));
+            return BlockOutput { lines };
+        }
+
         // Common path: no diagrams (or raw mode) → plain markdown, no affordance
         // machinery and no extra output rebuild.
         if ctx.raw || self.mermaid.is_empty() {
@@ -183,6 +280,7 @@ impl BlockContent for AgentMessageBlock {
         if ctx.raw
             || self.mermaid.is_empty()
             || self.mermaid_display_mode() != mermaid_content::MermaidDisplay::Affordances
+            || self.is_multi_agent_argument() && ctx.mode != DisplayMode::Expanded
         {
             return Vec::new();
         }
@@ -205,7 +303,12 @@ impl BlockContent for AgentMessageBlock {
     }
 
     fn accent(&self, _ctx: &BlockContext) -> Option<AccentStyle> {
-        None
+        if self.is_multi_agent_argument() {
+            let theme = Theme::current();
+            Some(AccentStyle::static_color(theme.accent_running))
+        } else {
+            None
+        }
     }
 
     fn has_vpad(&self, _ctx: &BlockContext) -> bool {
@@ -217,7 +320,52 @@ impl BlockContent for AgentMessageBlock {
     }
 
     fn is_foldable(&self) -> bool {
-        false
+        // Always fold multi-agent speaker dumps; long normal replies stay open.
+        self.is_multi_agent_argument()
+    }
+
+    fn next_fold_mode(&self, current: DisplayMode, is_running: bool) -> DisplayMode {
+        if !self.is_multi_agent_argument() {
+            return DisplayMode::Expanded;
+        }
+        if is_running {
+            match current {
+                DisplayMode::Collapsed | DisplayMode::Truncated => DisplayMode::Expanded,
+                DisplayMode::Expanded => DisplayMode::Truncated,
+            }
+        } else {
+            match current {
+                DisplayMode::Collapsed => DisplayMode::Expanded,
+                DisplayMode::Truncated | DisplayMode::Expanded => DisplayMode::Collapsed,
+            }
+        }
+    }
+
+    fn collapse_mode(&self, is_running: bool) -> DisplayMode {
+        if !self.is_multi_agent_argument() {
+            return DisplayMode::Expanded;
+        }
+        if is_running {
+            DisplayMode::Truncated
+        } else {
+            DisplayMode::Collapsed
+        }
+    }
+
+    fn default_display_mode(&self) -> DisplayMode {
+        if self.is_multi_agent_argument() {
+            DisplayMode::Collapsed
+        } else {
+            DisplayMode::Expanded
+        }
+    }
+
+    fn finished_display_mode(&self) -> Option<DisplayMode> {
+        if self.is_multi_agent_argument() {
+            Some(DisplayMode::Collapsed)
+        } else {
+            None
+        }
     }
 
     fn image_references(&self) -> &[crate::prompt_images::ScrollbackImageRef] {
