@@ -214,9 +214,21 @@ impl SessionActor {
                 self.run_swarm_pipeline(prompt_id, user_text, &event_tx, &session_id, &id_prefix)
                     .await
             }
-            OrchestrationMode::Heavy | OrchestrationMode::SwarmHeavy => {
+            OrchestrationMode::Heavy => {
+                // Collaborative council (argue) → Research → Implement → Test
                 self.run_council_rit_pipeline(
                     mode,
+                    prompt_id,
+                    user_text,
+                    &event_tx,
+                    &session_id,
+                    &id_prefix,
+                )
+                .await
+            }
+            OrchestrationMode::SwarmHeavy => {
+                // Full stack: collaborative Heavy council → Swarm fan-out → H2 verify
+                self.run_swarm_heavy_pipeline(
                     prompt_id,
                     user_text,
                     &event_tx,
@@ -414,7 +426,274 @@ impl SessionActor {
         commands::ok_end_turn(0, None)
     }
 
-    // ── Heavy / Swarm Heavy: council + RIT ──────────────────────────────
+    // ── Swarm Heavy: collaborative council → swarm fan-out → H2 verify ───
+    //
+    // This is the full stack the product promises:
+    //   H1  first-pass council (same problem, many lenses)
+    //   H1b cross-check — each member *sees the others* and argues
+    //   S2  swarm map fan-out (many independent units)
+    //   S3  implement
+    //   H2  re-council verify (Verifier + Skeptic attack the result)
+    //   F   captain final
+
+    async fn run_swarm_heavy_pipeline(
+        self: &Arc<Self>,
+        prompt_id: &str,
+        user_text: &str,
+        event_tx: &tokio::sync::mpsc::UnboundedSender<SubagentEvent>,
+        session_id: &str,
+        id_prefix: &str,
+    ) -> PromptTurnResult {
+        tracing::info!(
+            session_id = %session_id,
+            "swarm_heavy_pipeline: H1 collaborate → S2 fan-out → H2 verify"
+        );
+
+        let open = self
+            .captain_speak(CaptainPhase::OpenSwarmHeavy, user_text, &[], None, 1_200)
+            .await;
+        if let Some(text) = open {
+            self.emit_agent_text(&text).await;
+        } else {
+            self.emit_agent_text(&format!(
+                "⬢ **SWARM HEAVY** — collaborative council first (they argue), \
+                 then a swarm fan-out of workers, then verify.\n\n**Goal:** {}",
+                first_line(user_text, 200)
+            ))
+            .await;
+        }
+
+        let mut prior: Vec<(String, String)> = Vec::new();
+
+        // ── H1 + H1b: collaborative Heavy council ───────────────────────
+        let (council_digest, board_index, _) = self
+            .run_collaborative_council(
+                event_tx,
+                session_id,
+                prompt_id,
+                id_prefix,
+                user_text,
+                "SH/H1",
+                "⬢ SWARM HEAVY · H1 council",
+            )
+            .await;
+        prior.push(("h1-collaborative-council".into(), council_digest));
+
+        let captain_brief = self
+            .captain_speak(
+                CaptainPhase::AfterCollaborativeCouncil,
+                user_text,
+                &prior,
+                Some(&board_index),
+                2_000,
+            )
+            .await;
+        if let Some(ref text) = captain_brief {
+            self.emit_agent_text(text).await;
+        } else {
+            self.emit_agent_text(&format!(
+                "Council agreed/disputed:\n\n{board_index}\n\n\
+                 → Swarm fan-out next (many workers on units)."
+            ))
+            .await;
+        }
+        let captain_direction = captain_brief.unwrap_or_default();
+
+        // ── S2: Swarm map fan-out (lots of agents) ──────────────────────
+        self.emit_agent_text(
+            "── **SH/S2 swarm fan-out · wave 1** · launching 4 map units ──\n\
+             From the council plan: `diagnose` · `edges` · `plan` · `context`\n\
+             (parallel — open cards for full streams)",
+        )
+        .await;
+
+        let map_results = run_parallel_units(
+            self,
+            event_tx,
+            session_id,
+            prompt_id,
+            id_prefix,
+            user_text,
+            "⬢ SH/S2 map",
+            SWARM_MAP
+                .iter()
+                .map(|u| ParallelSpec {
+                    id: format!("sh-s-{}-{}", u.id_suffix, id_prefix),
+                    description: format!("[SH/S·{}] {}", u.id_suffix, u.title),
+                    label: u.title.to_string(),
+                    prompt: format!(
+                        "{lens}\n\n## User request\n\n{user}\n\n\
+                         ## Captain + collaborative council brief (follow this)\n\n{brief}\n\n\
+                         ## Return format\n\
+                         - **Status:** success | partial | blocked\n\
+                         - **Summary:** 3–8 bullets\n\
+                         - **Evidence:** paths / facts\n\
+                         - **Handoff:** what implement must know\n",
+                        lens = u.lens,
+                        user = user_text,
+                        brief = captain_direction.chars().take(4_000).collect::<String>(),
+                    ),
+                    subagent_type: u.subagent_type,
+                    capability: u.capability,
+                    background: true,
+                })
+                .collect(),
+        )
+        .await;
+
+        let mut map_digest = String::from("## SH/S2 swarm map wave\n\n");
+        for (label, result) in &map_results {
+            let body = result_body(result);
+            map_digest.push_str("### ");
+            map_digest.push_str(label);
+            map_digest.push_str("\n\n");
+            map_digest.push_str(&body.chars().take(8_000).collect::<String>());
+            map_digest.push_str("\n\n");
+        }
+        prior.push(("sh-s2-map".into(), map_digest));
+
+        let after_map = self
+            .captain_speak(
+                CaptainPhase::AfterMap,
+                user_text,
+                &prior,
+                Some(&captain_direction),
+                1_400,
+            )
+            .await;
+        if let Some(ref text) = after_map {
+            self.emit_agent_text(text).await;
+        }
+        let mut direction = after_map.unwrap_or(captain_direction);
+
+        // ── S3 implement ────────────────────────────────────────────────
+        self.emit_agent_text("── **SH/S3 implement** · one writer from the swarm plan ──")
+            .await;
+        let impl_prompt = build_stage_prompt(&STAGES[1], user_text, &prior, &direction);
+        match spawn_and_wait(
+            event_tx,
+            &format!("sh-impl-{}", id_prefix),
+            session_id,
+            Some(prompt_id.to_string()),
+            "[SH/S·impl] apply the fix",
+            "general-purpose",
+            CapMode::All,
+            impl_prompt,
+        )
+        .await
+        {
+            Ok(r) => {
+                let body = result_body(&Ok(r));
+                prior.push(("implement".into(), body.clone()));
+                if let Some(t) = self
+                    .captain_speak(
+                        CaptainPhase::AfterStage {
+                            stage: "implement",
+                            phase_n: 3,
+                        },
+                        user_text,
+                        &prior,
+                        Some(&extract_stage_summary(&body)),
+                        900,
+                    )
+                    .await
+                {
+                    self.emit_agent_text(&t).await;
+                    direction = t;
+                }
+            }
+            Err(e) => {
+                prior.push(("implement".into(), format!("[error] {e}")));
+                self.emit_agent_text(&format!("✗ SH/S3 implement failed: {e}")).await;
+            }
+        }
+
+        // ── H2: re-council verify (collaborative attack on the result) ──
+        self.emit_agent_text(
+            "── **SH/H2 re-council** · Verifier + Skeptic attack the result ──\n\
+             Same problem, two lenses on the *actual* outcome (argue if needed).",
+        )
+        .await;
+
+        let impl_summary = prior
+            .iter()
+            .find(|(n, _)| n == "implement")
+            .map(|(_, b)| b.as_str())
+            .unwrap_or("(no implement output)");
+        let h2_specs = vec![
+            ParallelSpec {
+                id: format!("sh-h2-verifier-{}", id_prefix),
+                description: "[SH/H2·Verifier] verify the work".into(),
+                label: "Verifier".into(),
+                prompt: format!(
+                    "You are the VERIFIER on a Swarm Heavy H2 re-council.\n\
+                     Run/check evidence that the user's goal was met. Be concrete.\n\n\
+                     ## User request\n\n{user}\n\n## Implement output\n\n{impl_out}\n\n\
+                     ## Captain direction\n\n{dir}\n\n\
+                     Return Thesis / Evidence / Residual risks / Verdict: pass|fail|partial.",
+                    user = user_text,
+                    impl_out = impl_summary.chars().take(10_000).collect::<String>(),
+                    dir = direction.chars().take(3_000).collect::<String>(),
+                ),
+                subagent_type: "explore",
+                capability: CapMode::Execute,
+                background: true,
+            },
+            ParallelSpec {
+                id: format!("sh-h2-skeptic-{}", id_prefix),
+                description: "[SH/H2·Skeptic] attack weak claims".into(),
+                label: "Skeptic".into(),
+                prompt: format!(
+                    "You are the SKEPTIC on a Swarm Heavy H2 re-council.\n\
+                     Attack weak claims in the implement result. What could still be wrong?\n\n\
+                     ## User request\n\n{user}\n\n## Implement output\n\n{impl_out}\n\n\
+                     Return Thesis / Attacks / What would falsify PASS / Residual risks.",
+                    user = user_text,
+                    impl_out = impl_summary.chars().take(10_000).collect::<String>(),
+                ),
+                subagent_type: "explore",
+                capability: CapMode::ReadOnly,
+                background: true,
+            },
+        ];
+        let h2_results = run_parallel_units(
+            self,
+            event_tx,
+            session_id,
+            prompt_id,
+            id_prefix,
+            user_text,
+            "⬢ SH/H2 verify council",
+            h2_specs,
+        )
+        .await;
+        let mut h2_digest = String::from("## SH/H2 re-council\n\n");
+        for (label, result) in &h2_results {
+            h2_digest.push_str("### ");
+            h2_digest.push_str(label);
+            h2_digest.push_str("\n\n");
+            h2_digest.push_str(&result_body(result).chars().take(8_000).collect::<String>());
+            h2_digest.push_str("\n\n");
+        }
+        prior.push(("h2-verify-council".into(), h2_digest));
+
+        let final_answer = self
+            .captain_speak(
+                CaptainPhase::FinalSwarmHeavy,
+                user_text,
+                &prior,
+                Some(&direction),
+                4_096,
+            )
+            .await
+            .unwrap_or_else(|| {
+                synthesize_board_dump(user_text, &prior, "⬢ SWARM HEAVY RESULT")
+            });
+        self.emit_agent_text(&final_answer).await;
+        commands::ok_end_turn(0, None)
+    }
+
+    // ── Heavy: collaborative council + RIT ──────────────────────────────
 
     async fn run_council_rit_pipeline(
         self: &Arc<Self>,
@@ -428,7 +707,7 @@ impl SessionActor {
         tracing::info!(
             session_id = %session_id,
             mode = %mode,
-            "heavy_pipeline: captain-led council + RIT"
+            "heavy_pipeline: collaborative council + RIT"
         );
 
         let open = self
@@ -438,8 +717,8 @@ impl SessionActor {
             self.emit_agent_text(&text).await;
         } else {
             self.emit_agent_text(&format!(
-                "{}\n\nI'm the **captain** — parallel council, then research → \
-                 implement → test. Worker cards hold the full streams.\n\n**Goal:** {}",
+                "{}\n\nI'm the **captain** — a collaborative council (they argue), \
+                 then research → implement → test.\n\n**Goal:** {}",
                 mode.brand(),
                 first_line(user_text, 200),
             ))
@@ -447,77 +726,23 @@ impl SessionActor {
         }
 
         let mut prior: Vec<(String, String)> = Vec::new();
-        let tag = match mode {
-            OrchestrationMode::SwarmHeavy => "SH/H1",
-            _ => "Council",
-        };
 
-        let h1 = match mode {
-            OrchestrationMode::SwarmHeavy => "── **SH/H1 council frame** · 4 parallel lenses ──",
-            _ => "── **H1 council frame** · 4 parallel lenses ──",
-        };
-        self.emit_agent_text(&format!(
-            "{h1}\n\
-             Analyst · Skeptic · Explorer · Builder — open their cards for detail."
-        ))
-        .await;
-
-        let council_specs: Vec<ParallelSpec> = COUNCIL
-            .iter()
-            .map(|m| ParallelSpec {
-                id: format!("council-{}-{}", m.id_suffix, id_prefix),
-                description: format!("[{tag}/{}] {}", m.role, m.role.to_ascii_lowercase()),
-                label: m.role.to_string(),
-                prompt: format!(
-                    "{lens}\n\n## User request\n\n{user}\n\n## Return format\n\
-                     - **Thesis** (1–3 sentences)\n\
-                     - **Argument** (bullets)\n\
-                     - **Evidence** (paths / facts)\n\
-                     - **Risks**\n\
-                     - **What to check next**\n",
-                    lens = m.lens,
-                    user = user_text
-                ),
-                subagent_type: "explore",
-                capability: CapMode::ReadOnly,
-                background: true,
-            })
-            .collect();
-
-        let council_results = run_parallel_units(
-            self,
-            event_tx,
-            session_id,
-            prompt_id,
-            id_prefix,
-            user_text,
-            &mode.brand(),
-            council_specs,
-        )
-        .await;
-
-        let mut council_digest = String::from("## Council board\n\n");
-        let mut theses: Vec<(String, String)> = Vec::new();
-        for (label, result) in &council_results {
-            let body = result_body(result);
-            theses.push((label.clone(), extract_thesis(&body)));
-            council_digest.push_str("### ");
-            council_digest.push_str(label);
-            council_digest.push_str("\n\n");
-            council_digest.push_str(&body.chars().take(12_000).collect::<String>());
-            council_digest.push_str("\n\n");
-        }
-        prior.push(("council".into(), council_digest));
-
-        let board_index = theses
-            .iter()
-            .map(|(r, t)| format!("- **{r}:** {t}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (council_digest, board_index, _) = self
+            .run_collaborative_council(
+                event_tx,
+                session_id,
+                prompt_id,
+                id_prefix,
+                user_text,
+                "Council",
+                "◈ HEAVY · council",
+            )
+            .await;
+        prior.push(("collaborative-council".into(), council_digest));
 
         let captain_brief = self
             .captain_speak(
-                CaptainPhase::AfterCouncil,
+                CaptainPhase::AfterCollaborativeCouncil,
                 user_text,
                 &prior,
                 Some(&board_index),
@@ -528,7 +753,7 @@ impl SessionActor {
             self.emit_agent_text(text).await;
         } else {
             self.emit_agent_text(&format!(
-                "Council board:\n\n{board_index}\n\n→ Research → Implement → Test."
+                "Council board (after debate):\n\n{board_index}\n\n→ Research → Implement → Test."
             ))
             .await;
         }
@@ -560,19 +785,13 @@ impl SessionActor {
 
             let prompt = build_stage_prompt(stage, user_text, &prior, &captain_direction);
             let child_id = format!("pipe-{}-{}", stage.id_suffix, id_prefix);
-            let desc = match mode {
-                OrchestrationMode::SwarmHeavy => {
-                    format!("[SH/S·{}] {}", stage.id_suffix, stage.id_suffix)
-                }
-                _ => stage.description.to_string(),
-            };
 
             match spawn_and_wait(
                 event_tx,
                 &child_id,
                 session_id,
                 Some(prompt_id.to_string()),
-                &desc,
+                stage.description,
                 stage.subagent_type,
                 stage.capability,
                 prompt,
@@ -610,10 +829,6 @@ impl SessionActor {
             }
         }
 
-        let title = match mode {
-            OrchestrationMode::SwarmHeavy => "⬢ SWARM HEAVY RESULT",
-            _ => "◈ HEAVY RESULT",
-        };
         let final_answer = self
             .captain_speak(
                 CaptainPhase::Final,
@@ -623,9 +838,162 @@ impl SessionActor {
                 4_096,
             )
             .await
-            .unwrap_or_else(|| synthesize_board_dump(user_text, &prior, title));
+            .unwrap_or_else(|| synthesize_board_dump(user_text, &prior, "◈ HEAVY RESULT"));
         self.emit_agent_text(&final_answer).await;
         commands::ok_end_turn(0, None)
+    }
+
+    /// H1 first pass (independent lenses) + H1b cross-check (they see each
+    /// other and argue). Returns (full digest, thesis board index, pass2 bodies).
+    async fn run_collaborative_council(
+        &self,
+        event_tx: &tokio::sync::mpsc::UnboundedSender<SubagentEvent>,
+        session_id: &str,
+        prompt_id: &str,
+        id_prefix: &str,
+        user_text: &str,
+        tag: &str,
+        board_title: &str,
+    ) -> (String, String, Vec<(String, String)>) {
+        // ── Pass 1: independent first takes ─────────────────────────────
+        self.emit_agent_text(&format!(
+            "── **{tag} pass 1** · same problem, 4 independent lenses ──\n\
+             Analyst · Skeptic · Explorer · Builder — first takes (no peeking yet)."
+        ))
+        .await;
+
+        let pass1_specs: Vec<ParallelSpec> = COUNCIL
+            .iter()
+            .map(|m| ParallelSpec {
+                id: format!("council-p1-{}-{}", m.id_suffix, id_prefix),
+                description: format!("[{tag}·{}] first pass", m.role),
+                label: m.role.to_string(),
+                prompt: format!(
+                    "{lens}\n\n## User request\n\n{user}\n\n## Return format\n\
+                     - **Thesis** (1–3 sentences)\n\
+                     - **Argument** (bullets)\n\
+                     - **Evidence** (paths / facts)\n\
+                     - **Risks**\n\
+                     - **What to check next**\n\
+                     Do NOT assume others' views — this is your independent first pass.",
+                    lens = m.lens,
+                    user = user_text
+                ),
+                subagent_type: "explore",
+                capability: CapMode::ReadOnly,
+                background: true,
+            })
+            .collect();
+
+        let pass1 = run_parallel_units(
+            self,
+            event_tx,
+            session_id,
+            prompt_id,
+            id_prefix,
+            user_text,
+            &format!("{board_title} · pass 1"),
+            pass1_specs,
+        )
+        .await;
+
+        let mut pass1_bodies: Vec<(String, String)> = Vec::new();
+        let mut board_for_cross = String::from("## First-pass council board (anonymized peers)\n\n");
+        for (label, result) in &pass1 {
+            let body = result_body(result);
+            pass1_bodies.push((label.clone(), body.clone()));
+            board_for_cross.push_str("### ");
+            board_for_cross.push_str(label);
+            board_for_cross.push_str("\n\n");
+            board_for_cross.push_str(&body.chars().take(6_000).collect::<String>());
+            board_for_cross.push_str("\n\n");
+        }
+
+        // ── Pass 2: cross-check / debate (they see each other) ──────────
+        self.emit_agent_text(&format!(
+            "── **{tag} pass 2 · cross-check / debate** ──\n\
+             Same four agents now **see each other's theses**. They must agree, \
+             dissent, and update — this is the collaborative Heavy part."
+        ))
+        .await;
+
+        let pass2_specs: Vec<ParallelSpec> = COUNCIL
+            .iter()
+            .map(|m| {
+                let own = pass1_bodies
+                    .iter()
+                    .find(|(l, _)| l == m.role)
+                    .map(|(_, b)| b.as_str())
+                    .unwrap_or("");
+                ParallelSpec {
+                    id: format!("council-p2-{}-{}", m.id_suffix, id_prefix),
+                    description: format!("[{tag}·{}] cross-check debate", m.role),
+                    label: format!("{}′", m.role),
+                    prompt: format!(
+                        "{lens}\n\nYou already wrote a first-pass take. Now you see the FULL board \
+                         from the other council members. **Argue.**\n\
+                         - Cite who you agree/disagree with and why\n\
+                         - Attack weak claims; strengthen yours with evidence\n\
+                         - Update your final thesis after the debate\n\n\
+                         ## User request\n\n{user}\n\n\
+                         ## Your first-pass output\n\n{own}\n\n\
+                         ## Full council board (peers)\n\n{board}\n\n\
+                         ## Return format\n\
+                         - **Agreements** (who/what)\n\
+                         - **Disagreements** (who/what + why they're wrong or you're updating)\n\
+                         - **Updated Thesis** (1–3 sentences after debate)\n\
+                         - **Argument** (bullets)\n\
+                         - **Evidence**\n\
+                         - **Risks**\n\
+                         - **What the captain / next workers must do**\n",
+                        lens = m.lens,
+                        user = user_text,
+                        own = own.chars().take(5_000).collect::<String>(),
+                        board = board_for_cross.chars().take(14_000).collect::<String>(),
+                    ),
+                    subagent_type: "explore",
+                    capability: CapMode::ReadOnly,
+                    background: true,
+                }
+            })
+            .collect();
+
+        let pass2 = run_parallel_units(
+            self,
+            event_tx,
+            session_id,
+            prompt_id,
+            id_prefix,
+            user_text,
+            &format!("{board_title} · debate"),
+            pass2_specs,
+        )
+        .await;
+
+        let mut digest = String::from("## Collaborative council\n\n### Pass 1 (independent)\n\n");
+        digest.push_str(&board_for_cross);
+        digest.push_str("\n### Pass 2 (cross-check / debate)\n\n");
+        let mut theses: Vec<(String, String)> = Vec::new();
+        let mut pass2_bodies: Vec<(String, String)> = Vec::new();
+        for (label, result) in &pass2 {
+            let body = result_body(result);
+            // strip prime for index
+            let role = label.trim_end_matches('′').to_string();
+            theses.push((role.clone(), extract_thesis(&body)));
+            pass2_bodies.push((role, body.clone()));
+            digest.push_str("### ");
+            digest.push_str(label);
+            digest.push_str("\n\n");
+            digest.push_str(&body.chars().take(10_000).collect::<String>());
+            digest.push_str("\n\n");
+        }
+        let board_index = theses
+            .iter()
+            .map(|(r, t)| format!("- **{r}:** {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        (digest, board_index, pass2_bodies)
     }
 
     async fn emit_agent_text(&self, text: &str) {
@@ -844,12 +1212,15 @@ async fn run_parallel_units(
 enum CaptainPhase<'a> {
     Open,
     OpenSwarm,
+    OpenSwarmHeavy,
     AfterCouncil,
+    AfterCollaborativeCouncil,
     AfterMap,
     BeforeStage { stage: &'a str, phase_n: usize },
     AfterStage { stage: &'a str, phase_n: usize },
     Final,
     FinalSwarm,
+    FinalSwarmHeavy,
 }
 
 impl std::fmt::Display for CaptainPhase<'_> {
@@ -857,12 +1228,15 @@ impl std::fmt::Display for CaptainPhase<'_> {
         match self {
             Self::Open => write!(f, "open"),
             Self::OpenSwarm => write!(f, "open_swarm"),
+            Self::OpenSwarmHeavy => write!(f, "open_swarm_heavy"),
             Self::AfterCouncil => write!(f, "after_council"),
+            Self::AfterCollaborativeCouncil => write!(f, "after_collab_council"),
             Self::AfterMap => write!(f, "after_map"),
             Self::BeforeStage { stage, .. } => write!(f, "before_{stage}"),
             Self::AfterStage { stage, .. } => write!(f, "after_{stage}"),
             Self::Final => write!(f, "final"),
             Self::FinalSwarm => write!(f, "final_swarm"),
+            Self::FinalSwarmHeavy => write!(f, "final_swarm_heavy"),
         }
     }
 }
@@ -875,14 +1249,25 @@ you talk to the user in first person — decisive, concrete, not a CI log.\n\
 Do not dump worker transcripts. Do not invent completed work.\n";
         let phase = match self {
             Self::Open => "\
-PHASE OPEN (Heavy): 2 short paragraphs — restate goal, say you'll run a 4-lens \
-council then research/implement/test. No fake completion.",
+PHASE OPEN (Heavy): 2 short paragraphs — restate goal, say you'll run a \
+*collaborative* 4-lens council (first independent, then they debate each other), \
+then research/implement/test. No fake completion.",
             Self::OpenSwarm => "\
 PHASE OPEN (Swarm): 2 short paragraphs — restate goal, say you'll map→reduce with \
 parallel units then implement+verify. No fake completion.",
+            Self::OpenSwarmHeavy => "\
+PHASE OPEN (Swarm Heavy): 2 short paragraphs — restate goal. Promise BOTH:\n\
+(1) Heavy-style collaborative council that argues among themselves, then\n\
+(2) a Swarm fan-out of many workers, then H2 verify council.\n\
+No fake completion.",
             Self::AfterCouncil => "\
 PHASE AFTER COUNCIL: judge the board, note agreement/conflict, write a short \
 captain brief for Research→Implement→Test.",
+            Self::AfterCollaborativeCouncil => "\
+PHASE AFTER COLLABORATIVE COUNCIL: The council did two passes — independent then \
+*debate* (they saw each other). Summarize agreements vs real fights. Write a \
+clear captain brief that a swarm of implementers can execute. Name the units \
+you want fanned out if useful.",
             Self::AfterMap => "\
 PHASE AFTER MAP WAVE: reduce map-unit findings into a clear implement brief.",
             Self::BeforeStage { stage, phase_n } => {
@@ -903,6 +1288,10 @@ Answer the request; cite evidence; residual risks brief.",
             Self::FinalSwarm => "\
 PHASE FINAL: complete user-facing answer. Prefer title `# ⬡ SWARM RESULT`. \
 Answer the request; attribute key findings to units when useful.",
+            Self::FinalSwarmHeavy => "\
+PHASE FINAL: complete user-facing answer. Prefer title `# ⬢ SWARM HEAVY RESULT`.\n\
+You had: collaborative council debate + swarm map + implement + H2 verify council.\n\
+Answer the user fully; note where H2 disagreed with implement if relevant.",
         };
         format!("{base}\n{phase}")
     }
@@ -917,8 +1306,8 @@ Answer the request; attribute key findings to units when useful.",
         if !prior.is_empty() {
             s.push_str("## Board (for you)\n\n");
             let cap = match self {
-                Self::Final | Self::FinalSwarm => 8_000,
-                Self::AfterCouncil | Self::AfterMap => 5_000,
+                Self::Final | Self::FinalSwarm | Self::FinalSwarmHeavy => 8_000,
+                Self::AfterCouncil | Self::AfterCollaborativeCouncil | Self::AfterMap => 5_000,
                 _ => 3_500,
             };
             for (name, body) in prior {
